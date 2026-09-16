@@ -38,7 +38,20 @@ pub(crate) enum ClientEndpointFocusTarget {
 }
 
 impl ClientShellState {
+    #[cfg(test)]
     pub(crate) fn set_endpoint_catalog(&mut self, profiles: &[SavedSshEndpoint]) {
+        let profiles = profiles
+            .iter()
+            .map(|profile| SavedEndpointProfile {
+                endpoint_id: ClientEndpointId::Ssh(profile.id.clone()),
+                label: profile.label.clone(),
+                enabled: profile.enabled,
+            })
+            .collect::<Vec<_>>();
+        self.set_endpoint_profiles(&profiles);
+    }
+
+    pub(crate) fn set_endpoint_profiles(&mut self, profiles: &[SavedEndpointProfile]) {
         let mut next = Vec::with_capacity(profiles.len().saturating_add(1));
         let local = self
             .endpoints
@@ -48,7 +61,7 @@ impl ClientShellState {
             .unwrap_or_else(local_endpoint);
         next.push(local);
         for profile in profiles {
-            let endpoint_id = ClientEndpointId::Ssh(profile.id.clone());
+            let endpoint_id = profile.endpoint_id.clone();
             let previous = self
                 .endpoints
                 .iter()

@@ -45,6 +45,7 @@ pub(crate) enum EndpointSupervisorEvent {
 enum ConnectTarget {
     Local(PathBuf),
     Ssh(super::SavedSshEndpoint),
+    Relay(super::SavedRelayEndpoint),
 }
 
 struct ReconnectState {
@@ -76,8 +77,17 @@ pub(crate) struct EndpointSupervisors {
 }
 
 impl EndpointSupervisors {
+    #[cfg(test)]
     pub(crate) fn new(profiles: &[super::SavedSshEndpoint], now: Instant) -> Self {
-        let endpoints = profiles
+        Self::new_all(profiles, &[], now)
+    }
+
+    pub(crate) fn new_all(
+        ssh_profiles: &[super::SavedSshEndpoint],
+        relay_profiles: &[super::SavedRelayEndpoint],
+        now: Instant,
+    ) -> Self {
+        let endpoints = ssh_profiles
             .iter()
             .filter(|profile| profile.enabled)
             .map(|profile| {
@@ -86,6 +96,17 @@ impl EndpointSupervisors {
                     ReconnectState::new(ConnectTarget::Ssh(profile.clone()), now),
                 )
             })
+            .chain(
+                relay_profiles
+                    .iter()
+                    .filter(|profile| profile.enabled)
+                    .map(|profile| {
+                        (
+                            ClientEndpointId::Relay(profile.id.clone()),
+                            ReconnectState::new(ConnectTarget::Relay(profile.clone()), now),
+                        )
+                    }),
+            )
             .collect();
         Self {
             endpoints,
@@ -103,6 +124,7 @@ impl EndpointSupervisors {
         self.endpoints.insert(ClientEndpointId::Local, state);
     }
 
+    #[cfg(test)]
     pub(crate) fn reconcile_profiles(
         &mut self,
         profiles: &[super::SavedSshEndpoint],
@@ -134,6 +156,54 @@ impl EndpointSupervisors {
         retired
     }
 
+    pub(crate) fn reconcile_all(
+        &mut self,
+        profiles: &super::EndpointProfiles,
+        now: Instant,
+    ) -> Vec<ClientEndpointId> {
+        let mut retired = Vec::new();
+        self.endpoints.retain(|endpoint_id, state| {
+            let keep = match &state.target {
+                ConnectTarget::Local(_) => true,
+                ConnectTarget::Ssh(previous) => profiles.ssh.iter().any(|profile| {
+                    profile.id == previous.id
+                        && profile.enabled
+                        && profile.target == previous.target
+                        && profile.session == previous.session
+                }),
+                ConnectTarget::Relay(previous) => profiles.relay.iter().any(|profile| {
+                    profile.id == previous.id
+                        && profile.enabled
+                        && profile.relay_url == previous.relay_url
+                        && profile.route_id == previous.route_id
+                        && profile.target_public_key == previous.target_public_key
+                        && profile.session == previous.session
+                        && profile.credential_id == previous.credential_id
+                        && profile.connection_revision == previous.connection_revision
+                }),
+            };
+            if !keep {
+                retired.push(endpoint_id.clone());
+            }
+            keep
+        });
+        for profile in profiles.ssh.iter().filter(|profile| profile.enabled) {
+            let state = self
+                .endpoints
+                .entry(ClientEndpointId::Ssh(profile.id.clone()))
+                .or_insert_with(|| ReconnectState::new(ConnectTarget::Ssh(profile.clone()), now));
+            state.target = ConnectTarget::Ssh(profile.clone());
+        }
+        for profile in profiles.relay.iter().filter(|profile| profile.enabled) {
+            let state = self
+                .endpoints
+                .entry(ClientEndpointId::Relay(profile.id.clone()))
+                .or_insert_with(|| ReconnectState::new(ConnectTarget::Relay(profile.clone()), now));
+            state.target = ConnectTarget::Relay(profile.clone());
+        }
+        retired
+    }
+
     pub(crate) fn spawn_due(
         &mut self,
         now: Instant,
@@ -151,6 +221,7 @@ impl EndpointSupervisors {
             self.next_generation = self.next_generation.saturating_add(1);
             let endpoint_id = endpoint_id.clone();
             let target = state.target.clone();
+            let failure_target = target.clone();
             let event_tx = event_tx.clone();
             let shutdown = self.shutdown.clone();
             tokio::spawn(async move {
@@ -167,7 +238,7 @@ impl EndpointSupervisors {
                     Ok(Err(error)) => EndpointSupervisorEvent::Status {
                         endpoint_id: task_endpoint_id,
                         generation,
-                        status: if failure_needs_attention(&error) {
+                        status: if failure_needs_attention(&failure_target, &error) {
                             ClientEndpointStatus::Attention
                         } else {
                             ClientEndpointStatus::Reconnecting
@@ -262,7 +333,14 @@ fn connect_once(
     endpoint_id: ClientEndpointId,
     generation: u64,
 ) -> Result<EndpointSupervisorEvent, std::io::Error> {
-    let (mut stream, lifetime): (_, Box<dyn Send>) = match target {
+    enum Lifetime {
+        None,
+        Ssh {
+            _bridge: crate::remote::SavedSshBridge,
+        },
+        Relay(crate::relay::transport::RelayClientBridge),
+    }
+    let (mut stream, lifetime) = match target {
         ConnectTarget::Local(path) => {
             let stream = crate::ipc::connect_local_stream(path).map_err(|error| {
                 // An absent Local socket is transient, unlike a missing SSH install.
@@ -275,15 +353,24 @@ fn connect_once(
                     error
                 }
             })?;
-            (stream, Box::new(()))
+            (stream, Lifetime::None)
         }
         ConnectTarget::Ssh(profile) => {
             let connected = crate::remote::connect_saved_ssh(profile.id.as_str(), &profile.target, &profile.session).map_err(|error| {
-                if failure_needs_attention(&error) {
+                if crate::remote::saved_ssh_failure_needs_attention(&error) {
                     std::io::Error::new(error.kind(), format!("{error}. Run `{}` interactively to approve setup, then restart this client", crate::remote::saved_ssh_bootstrap_command(&profile.target, &profile.session)))
                 } else { error }
             })?;
-            (connected.stream, Box::new(connected.bridge))
+            (
+                connected.stream,
+                Lifetime::Ssh {
+                    _bridge: connected.bridge,
+                },
+            )
+        }
+        ConnectTarget::Relay(profile) => {
+            let connected = crate::relay::transport::connect_controller(profile)?;
+            (connected.stream, Lifetime::Relay(connected.bridge))
         }
     };
     let handshake = super::super::do_handshake(
@@ -298,7 +385,11 @@ fn connect_once(
         options.mouse_capture,
         false,
     )
-    .map_err(handshake_error)?;
+    .map_err(handshake_error)
+    .map_err(|error| match &lifetime {
+        Lifetime::Relay(bridge) => bridge.reported_failure().unwrap_or(error),
+        Lifetime::None | Lifetime::Ssh { .. } => error,
+    })?;
     if handshake.encoding != RenderEncoding::SemanticFrame {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -328,8 +419,13 @@ fn connect_once(
     })
 }
 
-fn failure_needs_attention(error: &std::io::Error) -> bool {
-    crate::remote::saved_ssh_failure_needs_attention(error)
+fn failure_needs_attention(target: &ConnectTarget, error: &std::io::Error) -> bool {
+    match target {
+        ConnectTarget::Relay(_) => crate::relay::transport::failure_needs_attention(error),
+        ConnectTarget::Local(_) | ConnectTarget::Ssh(_) => {
+            crate::remote::saved_ssh_failure_needs_attention(error)
+        }
+    }
 }
 
 fn handshake_error(error: crate::client::ClientError) -> std::io::Error {
@@ -373,6 +469,20 @@ mod tests {
             target: "build".into(),
             session: "agents".into(),
             enabled: true,
+        }
+    }
+
+    fn relay_profile() -> super::super::SavedRelayEndpoint {
+        super::super::SavedRelayEndpoint {
+            id: ProfileId::parse("abcdef0123456789abcdef0123456789").unwrap(),
+            label: "Relay".into(),
+            relay_url: "wss://relay.example".into(),
+            route_id: "unused".into(),
+            target_public_key: "unused".into(),
+            session: "agents".into(),
+            credential_id: "unused".into(),
+            enabled: true,
+            connection_revision: 0,
         }
     }
 
@@ -447,6 +557,56 @@ mod tests {
     }
 
     #[test]
+    fn repaired_relay_profile_retries_an_open_client_in_attention() {
+        let now = Instant::now();
+        let mut relay = relay_profile();
+        let id = ClientEndpointId::Relay(relay.id.clone());
+        let mut supervisors = EndpointSupervisors::new_all(&[], std::slice::from_ref(&relay), now);
+        supervisors.endpoints.get_mut(&id).unwrap().generation = Some(1);
+        assert!(supervisors.record_status(&id, 1, ClientEndpointStatus::Attention, now));
+        assert!(supervisors.endpoints[&id].next_attempt.is_none());
+        relay.connection_revision += 1;
+        assert_eq!(
+            supervisors.reconcile_all(
+                &super::super::EndpointProfiles {
+                    ssh: vec![],
+                    relay: vec![relay],
+                },
+                now
+            ),
+            vec![id.clone()]
+        );
+        assert_eq!(supervisors.endpoints[&id].next_attempt, Some(now));
+    }
+
+    #[test]
+    fn reconciling_one_transport_preserves_the_other() {
+        let now = Instant::now();
+        let ssh = profile();
+        let relay = relay_profile();
+        let ssh_id = ClientEndpointId::Ssh(ssh.id.clone());
+        let relay_id = ClientEndpointId::Relay(relay.id.clone());
+        let mut supervisors = EndpointSupervisors::new_all(
+            std::slice::from_ref(&ssh),
+            std::slice::from_ref(&relay),
+            now,
+        );
+        supervisors.endpoints.get_mut(&ssh_id).unwrap().generation = Some(2);
+        supervisors.endpoints.get_mut(&relay_id).unwrap().generation = Some(3);
+
+        let retired = supervisors.reconcile_all(
+            &super::super::EndpointProfiles {
+                ssh: Vec::new(),
+                relay: vec![relay],
+            },
+            now,
+        );
+
+        assert_eq!(retired, vec![ssh_id]);
+        assert_eq!(supervisors.endpoints[&relay_id].generation, Some(3));
+    }
+
+    #[test]
     fn brief_ssh_reconnections_do_not_reset_backoff() {
         let now = Instant::now();
         let profile = profile();
@@ -481,16 +641,43 @@ mod tests {
 
     #[test]
     fn handshake_network_failures_retry_but_incompatibility_needs_attention() {
+        let target = ConnectTarget::Ssh(profile());
         let timeout = handshake_error(crate::client::ClientError::ConnectionLost(
             std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"),
         ));
-        assert!(!failure_needs_attention(&timeout));
+        assert!(!failure_needs_attention(&target, &timeout));
         let rejected = handshake_error(crate::client::ClientError::HandshakeRejected {
             version: 1,
             error: "surface capability missing".into(),
         });
         assert_eq!(rejected.kind(), std::io::ErrorKind::Unsupported);
-        assert!(failure_needs_attention(&rejected));
+        assert!(failure_needs_attention(&target, &rejected));
+    }
+
+    #[test]
+    fn relay_network_failures_retry_but_auth_and_protocol_failures_need_attention() {
+        let target = ConnectTarget::Relay(relay_profile());
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::NotConnected,
+        ] {
+            assert!(!failure_needs_attention(
+                &target,
+                &std::io::Error::new(kind, "transient")
+            ));
+        }
+        for kind in [
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Unsupported,
+        ] {
+            assert!(failure_needs_attention(
+                &target,
+                &std::io::Error::new(kind, "permanent")
+            ));
+        }
     }
 
     #[test]

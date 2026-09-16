@@ -3,16 +3,28 @@ use super::*;
 pub(super) fn watch_profiles(
     event_tx: tokio::sync::mpsc::Sender<ClientLoopEvent>,
     should_quit: Arc<AtomicBool>,
+    initial: endpoint::EndpointProfiles,
 ) {
     // One bounded read per second per client, independent of rendering and pane count.
     std::thread::spawn(move || {
-        let mut previous = None;
+        let mut current = initial;
+        let mut previous_errors = Vec::new();
         while !should_quit.load(Ordering::Acquire) {
-            let current = endpoint::EndpointCatalog::load_profiles();
-            if previous.as_ref() != Some(&current) {
-                previous = Some(current.clone());
+            let (next, errors, changed) = merge_profile_loads(
+                &current,
+                endpoint::EndpointCatalog::load_ssh_profiles(),
+                endpoint::EndpointCatalog::load_relay_profiles(),
+            );
+            if errors != previous_errors {
+                for error in &errors {
+                    tracing::warn!(%error, "saved machine catalog reload failed; retaining the last valid profiles for that transport");
+                }
+                previous_errors = errors;
+            }
+            if changed {
+                current = next;
                 if event_tx
-                    .blocking_send(ClientLoopEvent::EndpointCatalog(current))
+                    .blocking_send(ClientLoopEvent::EndpointCatalog(Ok(current.clone())))
                     .is_err()
                 {
                     break;
@@ -23,6 +35,25 @@ pub(super) fn watch_profiles(
     });
 }
 
+fn merge_profile_loads(
+    current: &endpoint::EndpointProfiles,
+    ssh: Result<Vec<endpoint::SavedSshEndpoint>, String>,
+    relay: Result<Vec<endpoint::SavedRelayEndpoint>, String>,
+) -> (endpoint::EndpointProfiles, Vec<String>, bool) {
+    let mut next = current.clone();
+    let mut errors = Vec::new();
+    match ssh {
+        Ok(profiles) => next.ssh = profiles,
+        Err(error) => errors.push(format!("SSH: {error}")),
+    }
+    match relay {
+        Ok(profiles) => next.relay = profiles,
+        Err(error) => errors.push(format!("Relay: {error}")),
+    }
+    let changed = &next != current;
+    (next, errors, changed)
+}
+
 // Only called between surface handoffs: removing a source must not invalidate an in-flight
 // rollback. Connection attempts are independent and fenced by supervisor generations.
 pub(super) fn apply_profiles(
@@ -31,17 +62,17 @@ pub(super) fn apply_profiles(
     commands: &mut endpoint_commands::EndpointCommands,
     supervisors: &mut endpoint::EndpointSupervisors,
     catalog: &mut endpoint::EndpointCatalog,
-    profiles: Vec<endpoint::SavedSshEndpoint>,
+    profiles: endpoint::EndpointProfiles,
     now: std::time::Instant,
 ) -> bool {
-    if catalog.ssh == profiles {
+    if catalog.ssh == profiles.ssh && catalog.relay == profiles.relay {
         return false;
     }
     let previous_size = state
         .shell
         .as_ref()
         .map(|shell| shell.surface_size(state.reported_size.0, state.reported_size.1));
-    let retired = supervisors.reconcile_profiles(&profiles, now);
+    let retired = supervisors.reconcile_all(&profiles, now);
     let active_removed = retired.contains(endpoints.active_id());
     for endpoint_id in retired {
         endpoints.disconnect(&endpoint_id);
@@ -55,7 +86,8 @@ pub(super) fn apply_profiles(
             shell.retire_endpoint(&endpoint_id);
         }
     }
-    catalog.ssh = profiles;
+    catalog.ssh = profiles.ssh;
+    catalog.relay = profiles.relay;
     if active_removed {
         endpoints.select_unavailable_local();
         catalog.select_local();
@@ -63,16 +95,15 @@ pub(super) fn apply_profiles(
         if let Some(shell) = state.shell.as_mut() {
             shell.select_unavailable_local();
         }
-    } else if catalog.selected_profile.as_ref().is_some_and(|selected| {
-        !catalog
-            .ssh
-            .iter()
-            .any(|profile| &profile.id == selected && profile.enabled)
-    }) {
+    } else if catalog
+        .selected_endpoint
+        .as_ref()
+        .is_some_and(|selected| !catalog.endpoint_enabled(selected))
+    {
         catalog.select_local();
     }
     if let Some(shell) = state.shell.as_mut() {
-        shell.set_endpoint_catalog(&catalog.ssh);
+        shell.set_endpoint_profiles(&catalog.endpoint_profiles());
         if endpoints.active_surface_available()
             && previous_size
                 != Some(shell.surface_size(state.reported_size.0, state.reported_size.1))
@@ -150,6 +181,31 @@ mod tests {
     }
 
     #[test]
+    fn malformed_relay_catalog_does_not_block_ssh_reload() {
+        let current = endpoint::EndpointProfiles {
+            ssh: Vec::new(),
+            relay: vec![endpoint::SavedRelayEndpoint {
+                id: endpoint::ProfileId::parse("abcdef0123456789abcdef0123456789").unwrap(),
+                label: "Relay".into(),
+                relay_url: "wss://relay.example".into(),
+                route_id: "route".into(),
+                target_public_key: "key".into(),
+                session: "default".into(),
+                credential_id: "credential".into(),
+                enabled: true,
+                connection_revision: 0,
+            }],
+        };
+        let ssh = endpoint::SavedSshEndpoint::new("Build", "build", "default").unwrap();
+        let (next, errors, changed) =
+            merge_profile_loads(&current, Ok(vec![ssh.clone()]), Err("malformed".into()));
+        assert!(changed);
+        assert_eq!(next.ssh, vec![ssh]);
+        assert_eq!(next.relay, current.relay);
+        assert_eq!(errors, vec!["Relay: malformed"]);
+    }
+
+    #[test]
     fn live_catalog_add_and_rename_keep_local_connection_and_selection() {
         let now = Instant::now();
         let mut state = state();
@@ -168,7 +224,10 @@ mod tests {
                 &mut commands,
                 &mut supervisors,
                 &mut catalog,
-                vec![profile.clone()],
+                endpoint::EndpointProfiles {
+                    ssh: vec![profile.clone()],
+                    relay: Vec::new(),
+                },
                 now
             ));
             assert_eq!(endpoints.active_id(), &ClientEndpointId::Local);
@@ -180,7 +239,7 @@ mod tests {
                     .generation,
                 1
             );
-            assert_eq!(catalog.selected_profile, None);
+            assert_eq!(catalog.selected_endpoint, None);
             assert_eq!(
                 state
                     .shell
@@ -244,7 +303,10 @@ mod tests {
                     &mut commands,
                     &mut supervisors,
                     &mut catalog,
-                    profiles,
+                    endpoint::EndpointProfiles {
+                        ssh: profiles,
+                        relay: Vec::new(),
+                    },
                     now
                 ));
                 assert_eq!(endpoints.active_id(), &ClientEndpointId::Local);
@@ -261,7 +323,7 @@ mod tests {
                     .endpoint_is_active(&ClientEndpointId::Local));
                 assert!(!state.shell.as_ref().unwrap().has_presented_surface());
                 assert!(state.presentation_frozen);
-                assert_eq!(catalog.selected_profile, None);
+                assert_eq!(catalog.selected_endpoint, None);
                 assert_eq!(remote_disconnects.load(Ordering::Relaxed), 1);
                 assert_eq!(local_disconnects.load(Ordering::Relaxed), 0);
                 assert!(!supervisors.record_status(

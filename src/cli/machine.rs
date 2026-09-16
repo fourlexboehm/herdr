@@ -1,10 +1,11 @@
 use serde::Serialize;
 
-use crate::client::endpoint::{EndpointCatalog, ProfileId};
+use crate::client::endpoint::{ClientEndpointId, EndpointCatalog, ProfileId};
 
 const HELP: &str = "Usage:
   herdr machine list [--json]
   herdr machine add <ssh-target> --label <label> [--remote-session <name>]
+  herdr machine add-relay [--url <wss-url>] [--label <label>]
   herdr machine rename <profile-id> --label <label>
   herdr machine remove <profile-id>
   herdr machine enable <profile-id>
@@ -14,15 +15,16 @@ Add prepares the remote Herdr installation and starts its server before saving.
 Missing or incompatible installations require approval in an interactive terminal.
 Changes apply automatically to open local Herdr clients.
 Removing or disabling a machine leaves its remote sessions running.
-Saved machines contain only a label, SSH target, explicit Herdr session, and enabled state.
-SSH credentials and key material remain owned by OpenSSH.";
+Add-relay prints a pairing code and accepts the other device's code with Enter.
+Saved machine catalogs do not contain private keys or enrollment secrets.";
 
 #[derive(Serialize)]
-struct MachineListRow<'a> {
-    id: &'a str,
-    label: &'a str,
-    target: &'a str,
-    session: &'a str,
+struct MachineListRow {
+    id: String,
+    label: String,
+    transport: &'static str,
+    target: String,
+    session: String,
     enabled: bool,
     selected: bool,
 }
@@ -31,6 +33,7 @@ pub(super) fn run_machine_command(args: &[String]) -> std::io::Result<i32> {
     match args.first().map(String::as_str) {
         Some("list") => list(&args[1..]),
         Some("add") => add(&args[1..]),
+        Some("add-relay") => add_relay(&args[1..]),
         Some("rename") => rename(&args[1..]),
         Some("remove") => remove(&args[1..]),
         Some("enable") => set_enabled(&args[1..], true),
@@ -60,13 +63,25 @@ fn list(args: &[String]) -> std::io::Result<i32> {
         .ssh
         .iter()
         .map(|profile| MachineListRow {
-            id: profile.id.as_str(),
-            label: &profile.label,
-            target: &profile.target,
-            session: &profile.session,
+            id: profile.id.to_string(),
+            label: profile.label.clone(),
+            transport: "ssh",
+            target: profile.target.clone(),
+            session: profile.session.clone(),
             enabled: profile.enabled,
-            selected: catalog.selected_profile.as_ref() == Some(&profile.id),
+            selected: catalog.selected_endpoint.as_ref()
+                == Some(&ClientEndpointId::Ssh(profile.id.clone())),
         })
+        .chain(catalog.relay.iter().map(|profile| MachineListRow {
+            id: profile.id.to_string(),
+            label: profile.label.clone(),
+            transport: "relay",
+            target: profile.relay_url.clone(),
+            session: profile.session.clone(),
+            enabled: profile.enabled,
+            selected: catalog.selected_endpoint.as_ref()
+                == Some(&ClientEndpointId::Relay(profile.id.clone())),
+        }))
         .collect::<Vec<_>>();
     if json {
         println!(
@@ -76,17 +91,22 @@ fn list(args: &[String]) -> std::io::Result<i32> {
         return Ok(0);
     }
     if rows.is_empty() {
-        println!("No saved SSH machines.");
+        println!("No saved machines.");
         return Ok(0);
     }
     for row in rows {
         let state = if row.enabled { "enabled" } else { "disabled" };
         println!(
-            "{}\t{}\t{}\t{}\t{}",
-            row.id, row.label, row.target, row.session, state
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            row.id, row.label, row.transport, row.target, row.session, state
         );
     }
+
     Ok(0)
+}
+
+fn add_relay(args: &[String]) -> std::io::Result<i32> {
+    super::relay_setup::run(args)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -210,19 +230,25 @@ fn rename(args: &[String]) -> std::io::Result<i32> {
         }
     };
     let mut catalog = load_catalog()?;
-    match catalog.rename_ssh(&id, label) {
-        Ok(true) => {}
-        Ok(false) => {
+    let renamed_ssh = catalog
+        .rename_ssh(&id, label.clone())
+        .map_err(std::io::Error::other)?;
+    let renamed_relay = if renamed_ssh {
+        false
+    } else {
+        catalog
+            .rename_relay(&id, label)
+            .map_err(std::io::Error::other)?
+    };
+    match renamed_ssh || renamed_relay {
+        true => {}
+        false => {
             eprintln!("machine profile {id} was not found");
             return Ok(1);
         }
-        Err(error) => {
-            eprintln!("error: {error}");
-            return Ok(2);
-        }
     }
-    store_catalog(&catalog)?;
-    println!("Renamed SSH machine {id}.");
+    store_all_catalogs(&catalog)?;
+    println!("Renamed machine {id}.");
     Ok(0)
 }
 
@@ -231,16 +257,54 @@ fn remove(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     };
     let mut catalog = load_catalog()?;
-    let previous_selection = catalog.selected_profile.clone();
-    if !catalog.remove_ssh(&id) {
+    let previous_selection = catalog.selected_endpoint.clone();
+    let removed_ssh = catalog.remove_ssh(&id);
+    let removed_relay = if removed_ssh {
+        None
+    } else {
+        catalog.remove_relay(&id)
+    };
+    if !removed_ssh && removed_relay.is_none() {
         eprintln!("machine profile {id} was not found");
         return Ok(1);
     }
-    store_catalog(&catalog)?;
-    if catalog.selected_profile != previous_selection {
+    if let Some(profile) = removed_relay {
+        let credential_still_referenced = catalog
+            .relay
+            .iter()
+            .any(|candidate| candidate.credential_id == profile.credential_id);
+        let removed_credential = if credential_still_referenced {
+            None
+        } else {
+            crate::relay::store::RelayClientStore::update(|credentials| {
+                let removed = credentials
+                    .credentials
+                    .iter()
+                    .find(|credential| credential.id == profile.credential_id)
+                    .cloned();
+                credentials.remove(&profile.credential_id);
+                Ok(removed)
+            })
+            .map_err(std::io::Error::other)?
+        };
+        if let Err(error) = store_all_catalogs(&catalog) {
+            if let Some(credential) = removed_credential {
+                let _ = crate::relay::store::RelayClientStore::update(|credentials| {
+                    if credentials.credential(&credential.id).is_none() {
+                        credentials.credentials.push(credential);
+                    }
+                    Ok(())
+                });
+            }
+            return Err(error);
+        }
+    } else {
+        store_all_catalogs(&catalog)?;
+    }
+    if catalog.selected_endpoint != previous_selection {
         catalog.store_selection().map_err(std::io::Error::other)?;
     }
-    println!("Removed SSH machine {id}.");
+    println!("Removed machine {id}.");
     Ok(0)
 }
 
@@ -251,17 +315,19 @@ fn set_enabled(args: &[String], enabled: bool) -> std::io::Result<i32> {
         return Ok(2);
     };
     let mut catalog = load_catalog()?;
-    let previous_selection = catalog.selected_profile.clone();
-    if !catalog.set_enabled(&id, enabled) {
+    let previous_selection = catalog.selected_endpoint.clone();
+    let changed_ssh = catalog.set_enabled(&id, enabled);
+    let changed_relay = !changed_ssh && catalog.set_relay_enabled(&id, enabled);
+    if !changed_ssh && !changed_relay {
         eprintln!("machine profile {id} was not found");
         return Ok(1);
     }
-    store_catalog(&catalog)?;
-    if catalog.selected_profile != previous_selection {
+    store_all_catalogs(&catalog)?;
+    if catalog.selected_endpoint != previous_selection {
         catalog.store_selection().map_err(std::io::Error::other)?;
     }
     println!(
-        "{} SSH machine {id}.",
+        "{} machine {id}.",
         if enabled { "Enabled" } else { "Disabled" }
     );
     Ok(0)
@@ -287,6 +353,13 @@ fn load_catalog() -> std::io::Result<EndpointCatalog> {
 
 fn store_catalog(catalog: &EndpointCatalog) -> std::io::Result<()> {
     catalog.store_profiles().map_err(std::io::Error::other)
+}
+
+fn store_all_catalogs(catalog: &EndpointCatalog) -> std::io::Result<()> {
+    catalog.store_profiles().map_err(std::io::Error::other)?;
+    catalog
+        .store_relay_profiles()
+        .map_err(std::io::Error::other)
 }
 
 #[cfg(test)]
@@ -367,15 +440,17 @@ mod tests {
     #[test]
     fn list_rows_do_not_have_credential_fields() {
         let encoded = serde_json::to_string(&MachineListRow {
-            id: "0123456789abcdef0123456789abcdef",
-            label: "Build",
-            target: "dev@build",
-            session: "agents",
+            id: "0123456789abcdef0123456789abcdef".into(),
+            label: "Build".into(),
+            transport: "ssh",
+            target: "dev@build".into(),
+            session: "agents".into(),
             enabled: true,
             selected: false,
         })
         .unwrap();
         assert!(!encoded.contains("password"));
         assert!(!encoded.contains("key"));
+        assert!(encoded.contains(r#""target":"dev@build""#));
     }
 }

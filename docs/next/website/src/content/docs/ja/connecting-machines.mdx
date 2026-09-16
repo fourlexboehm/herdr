@@ -7,6 +7,43 @@ description: Local と保存済み SSH マシンを 1 つの Herdr ウィンド�
 
 各マシンは独自の Herdr サーバー、セッション、プロセスを保持します。1 台への接続が切れても、ほかの接続は切れません。
 
+## ファイアウォール越しの暗号化 Relay
+
+実験的な Relay マシンでは、ターゲットとコントローラーの両方が Cloudflare Worker へ外向き WSS 接続を作ります。ターゲット側に受信ポートや Cloudflare Tunnel は不要です。Durable Object はライブソケットを中継しますが、既存の Herdr endpoint generation 1 ストリームは Noise でエンドツーエンド暗号化されます。
+
+この機能は Linux/macOS 向けで、独立したセキュリティ監査をまだ受けていません。高リスクのリモートアクセスには使用しないでください。Cloudflare は内容を復号できませんが、IP アドレス、接続時刻、通信量を観測できます。
+
+リポジトリの Relay をデプロイします:
+
+```bash
+cd cloudflare/relay
+npm ci
+npm run check
+npx wrangler deploy
+```
+
+両方のデバイスのターミナルで、同じ Relay URL を指定して実行します:
+
+```bash
+herdr machine add-relay --url wss://example.workers.dev
+```
+
+各デバイスに表示された秘密のコードを、もう一方のデバイスの入力欄に貼り付けて Enter を押します。コードは信頼できる非公開の経路で転送してください。Herdr は暗号化接続とリモート endpoint を確認してから Connected と表示します。コードは 15 分で期限切れになります。
+
+必要なサーバーは自動起動します。このセットアップに対応した実行中サーバーは再起動せずに Relay の有効化・無効化を反映します。古い Relay ビルドのサーバーは先に更新してください。既存のホスト設定があれば URL とセッションを引き継ぐため、次回は `herdr machine add-relay` だけで実行できます。失敗時は両方で再実行し、新しいコードを交換してください。同じマシンの再設定ではコントローラーの鍵を維持し、マシンを重複登録しません。
+
+スクリプトでは `herdr relay invite` の出力を `herdr machine add-relay < relay-invitation.txt` に渡す方法も使えます。転送ファイルは保護し、使用後に削除してください。ペアリングはホストのアカウント権限でターミナルを操作する権限を与えます。
+
+ペアリング済みデバイスの確認と失効:
+
+```bash
+herdr relay devices
+herdr relay revoke <controller-public-key>
+herdr relay status
+```
+
+Cloudflare Free plan では SQLite-backed Durable Objects を利用できますが、継続的なターミナル出力は 1 日の無料リクエスト枠を使い切る可能性があります。Relay は Herdr データ、Noise 鍵、招待、端末履歴を保存せず、salt 付き登録 verifier と制限付きの不正利用カウンターだけを保存します。
+
 ## 接続前の確認
 
 リモートマシンへの通常の SSH アクセスが必要です。最初に確認してください:

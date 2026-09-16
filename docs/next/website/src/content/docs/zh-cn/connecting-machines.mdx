@@ -7,6 +7,43 @@ description: 在一个 Herdr 窗口中使用 Local 和已保存的 SSH 机器，
 
 每台机器保留自己的 Herdr 服务器、会话和进程。一台机器断线不会影响其他连接。
 
+## 穿过防火墙的加密 Relay
+
+实验性的 Relay 机器让目标端和控制端都向 Cloudflare Worker 建立出站 WSS 连接，因此目标端不需要开放入站端口，也不需要 Cloudflare Tunnel。Durable Object 只负责连接实时套接字；现有 Herdr endpoint generation 1 字节流会先用 Noise 做端到端加密。
+
+该功能目前面向 Linux 和 macOS，尚未经过独立安全审计，请勿用于高风险远程访问。Cloudflare 无法解密 Herdr 内容，但仍可观察 IP 地址、连接时间和流量大小。
+
+从仓库部署 Relay：
+
+```bash
+cd cloudflare/relay
+npm ci
+npm run check
+npx wrangler deploy
+```
+
+在两台设备的终端中使用同一个 Relay URL 运行：
+
+```bash
+herdr machine add-relay --url wss://example.workers.dev
+```
+
+每台设备都会显示自己的私密配对码，并等待粘贴另一台设备的配对码。将 A 的码粘贴到 B 并按 Enter，再将 B 的码粘贴到 A 并按 Enter。请通过可信的私密渠道传输。Herdr 验证加密连接和远端 endpoint 后才显示 Connected。配对码在 15 分钟后过期。
+
+需要的服务器会自动启动。支持此设置流程的运行中服务器无需重启即可应用 Relay 的启用、禁用和重新启用；旧版 Relay 服务器需先更新。已有主机配置会保留 URL 和会话，以后直接运行 `herdr machine add-relay` 即可。失败或过期时，在两端重新运行并交换新码；重试会保留控制端身份，不会重复添加机器。
+
+脚本仍可将 `herdr relay invite` 的输出传给 `herdr machine add-relay < relay-invitation.txt`。请保护并在使用后删除邀请文件。配对授予以主机账户权限操作终端的能力。
+
+查看和撤销已配对设备：
+
+```bash
+herdr relay devices
+herdr relay revoke <controller-public-key>
+herdr relay status
+```
+
+Cloudflare Free 计划支持这里使用的 SQLite-backed Durable Objects，但持续的终端输出可能耗尽每日免费请求额度。Relay 不保存 Herdr 数据、Noise 密钥、邀请或终端历史；它只保存加盐的注册校验值和有界的防滥用计数器。
+
 ## 连接前的准备
 
 你需要能够通过普通 SSH 访问远程机器。先验证：

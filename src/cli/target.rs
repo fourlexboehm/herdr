@@ -37,7 +37,7 @@ pub(super) fn maybe_run(args: &[String]) -> Option<io::Result<super::CommandOutc
         if super::spec::print_requested_help(&args)? {
             return Ok(super::CommandOutcome::Handled(0));
         }
-        let profiles = EndpointCatalog::load_profiles().map_err(io::Error::other)?;
+        let profiles = EndpointCatalog::load_ssh_profiles().map_err(io::Error::other)?;
         let profile = match resolve_machine(&profiles, &selector) {
             Ok(profile) => profile.clone(),
             Err(error) => return usage_error(error),

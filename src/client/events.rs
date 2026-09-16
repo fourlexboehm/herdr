@@ -22,7 +22,7 @@ pub(super) enum ClientLoopEvent {
         generation: u64,
     },
     EndpointSupervisor(endpoint::EndpointSupervisorEvent),
-    EndpointCatalog(Result<Vec<endpoint::SavedSshEndpoint>, String>),
+    EndpointCatalog(Result<endpoint::EndpointProfiles, String>),
     ActivateEndpoint {
         endpoint_id: endpoint::ClientEndpointId,
         target: Option<shell::ClientEndpointFocusTarget>,

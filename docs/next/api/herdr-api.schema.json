@@ -9232,6 +9232,40 @@
           ],
           "type": "string"
         },
+        "RelayConnectionStatus": {
+          "enum": [
+            "disabled",
+            "connecting",
+            "online",
+            "attention",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "RelayServerStatus": {
+          "properties": {
+            "configuration_id": {
+              "description": "Identifies the host configuration whose connection status is reported.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "controller_connections": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "status": {
+              "$ref": "#/schemas/success_response/$defs/RelayConnectionStatus"
+            }
+          },
+          "required": [
+            "status",
+            "controller_connections"
+          ],
+          "type": "object"
+        },
         "ResponseResult": {
           "oneOf": [
             {
@@ -10609,6 +10643,16 @@
             },
             "live_handoff": {
               "type": "boolean"
+            },
+            "relay": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/RelayServerStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "surface_interest": {
               "default": false,

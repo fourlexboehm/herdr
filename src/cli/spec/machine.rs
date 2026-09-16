@@ -4,11 +4,20 @@ use super::{json_flag, option};
 
 pub(super) fn command() -> Command {
     Command::new("machine")
-        .about("Manage saved SSH machines")
+        .about("Manage saved SSH and encrypted relay machines")
         .subcommand(
             Command::new("list")
-                .about("List saved SSH machines")
+                .about("List saved machines")
                 .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("add-relay")
+                .about("Exchange pairing codes and connect an encrypted relay machine")
+                .arg(
+                    option("url", "WSS_URL")
+                        .help("Relay URL; defaults to this device's saved relay"),
+                )
+                .arg(option("label", "LABEL").help("Override the target's machine label")),
         )
         .subcommand(
             Command::new("add")

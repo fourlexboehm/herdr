@@ -422,6 +422,7 @@ mod tests {
                 endpoint_protocol_generation: endpoint_generation,
                 surface_interest: true,
                 health_check: true,
+                relay: None,
             }),
         }
     }

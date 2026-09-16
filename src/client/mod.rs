@@ -199,14 +199,11 @@ fn run_client_with_mode(
     info!(path = %socket_path.display(), "{log_message}");
 
     let endpoint_catalog = if client_rendered_shell && !is_remote_client_process() {
-        endpoint::EndpointCatalog::load().unwrap_or_else(|error| {
-            warn!(%error, "saved SSH endpoint catalog is unavailable");
-            endpoint::EndpointCatalog::default()
-        })
+        endpoint::EndpointCatalog::load_for_client()
     } else {
         endpoint::EndpointCatalog::default()
     };
-    let federated = endpoint_catalog.has_enabled_ssh();
+    let federated = endpoint_catalog.has_enabled_remote();
 
     let initial_stream = match crate::ipc::connect_local_stream(&socket_path) {
         Ok(stream) => Some(stream),
@@ -418,10 +415,10 @@ async fn run_client_loop(
         detached_process_children: Vec::new(),
         shell: config.shell_config.map(shell::ClientShellState::new),
     };
-    let mut federated = endpoint_catalog.has_enabled_ssh();
+    let mut federated = endpoint_catalog.has_enabled_remote();
     if let Some(shell) = state.shell.as_mut() {
         shell.set_graphics_cell_size(initial_cell_width_px, initial_cell_height_px);
-        shell.set_endpoint_catalog(&endpoint_catalog.ssh);
+        shell.set_endpoint_profiles(&endpoint_catalog.endpoint_profiles());
         shell.set_endpoint_methods_for(
             &endpoint::ClientEndpointId::Local,
             initial
@@ -560,8 +557,11 @@ async fn run_client_loop(
     } else {
         endpoint::EndpointRegistry::empty()
     };
-    let mut supervisors =
-        endpoint::EndpointSupervisors::new(&endpoint_catalog.ssh, std::time::Instant::now());
+    let mut supervisors = endpoint::EndpointSupervisors::new_all(
+        &endpoint_catalog.ssh,
+        &endpoint_catalog.relay,
+        std::time::Instant::now(),
+    );
     if federated {
         supervisors.add_local(
             client_socket_path(),
@@ -583,9 +583,16 @@ async fn run_client_loop(
     let mut next_surface_serial = 1_u64;
     let mut pending_activation: Option<endpoint::PendingEndpointActivation> = None;
     let mut scheduled_activation = None;
-    let mut pending_catalog: Option<Result<Vec<endpoint::SavedSshEndpoint>, String>> = None;
+    let mut pending_catalog: Option<Result<endpoint::EndpointProfiles, String>> = None;
     if state.shell.is_some() && !is_remote_client && state.attach_escape.is_none() {
-        catalog_reload::watch_profiles(event_tx.clone(), should_quit.clone());
+        catalog_reload::watch_profiles(
+            event_tx.clone(),
+            should_quit.clone(),
+            endpoint::EndpointProfiles {
+                ssh: endpoint_catalog.ssh.clone(),
+                relay: endpoint_catalog.relay.clone(),
+            },
+        );
     }
 
     // This (foreground) client owns the prefix ASCII input-source switch
@@ -602,8 +609,11 @@ async fn run_client_loop(
                 match reload {
                     Ok(profiles) => {
                         let now = std::time::Instant::now();
-                        if !federated && profiles.iter().any(|profile| profile.enabled) {
-                            // Keep Local recovery once enabled, even after removing the last SSH profile.
+                        if !federated
+                            && (profiles.ssh.iter().any(|profile| profile.enabled)
+                                || profiles.relay.iter().any(|profile| profile.enabled))
+                        {
+                            // Keep Local recovery once enabled, even after removing the last remote profile.
                             federated = true;
                             supervisors.add_local(
                                 client_socket_path(),
@@ -1963,11 +1973,9 @@ async fn run_client_loop(
                         }
                         write_stream.mark_ready(&endpoint_id, generation);
                         let selected_endpoint = endpoint_catalog
-                            .selected_profile
-                            .as_ref()
-                            .map_or(endpoint::ClientEndpointId::Local, |profile_id| {
-                                endpoint::ClientEndpointId::Ssh(profile_id.clone())
-                            });
+                            .selected_endpoint
+                            .clone()
+                            .unwrap_or(endpoint::ClientEndpointId::Local);
                         let activation_ready = state.shell.as_ref().is_some_and(|shell| {
                             shell.endpoint_has_snapshot(&selected_endpoint)
                                 && (!write_stream

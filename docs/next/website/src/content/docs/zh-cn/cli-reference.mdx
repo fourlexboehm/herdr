@@ -45,18 +45,19 @@ herdr api schema --output herdr-api.schema.json
 
 `herdr api schema` 会打印安装的二进制中包含的 socket 协议 schema 简短摘要。需要完整 JSON Schema 文档时使用 `--json`;要写入文件则使用 `--output PATH`。
 
-## 已保存的 SSH 机器
+## 已保存的机器
 
 ```bash
 herdr machine list
 herdr machine add workbox --label "Build machine"
+herdr machine add-relay --label "Studio" < relay-invitation.txt
 herdr machine rename <profile-id> --label "New name"
 herdr machine disable <profile-id>
 herdr machine enable <profile-id>
 herdr machine remove <profile-id>
 ```
 
-`machine add` 默认使用远程默认会话。只有需要命名会话时才添加 `--remote-session <name>`。`machine list` 支持可选的 `--json` 供脚本使用。完整流程见[连接机器](/zh-cn/docs/connecting-machines/)。
+`machine add` 默认使用远程默认会话。只有需要命名会话时才添加 `--remote-session <name>`。`machine add-relay` 显示本机配对码，等待粘贴对方的码并按 Enter，然后验证加密连接。两端均需运行，首次使用 `--url` 指定 Relay。仍支持从标准输入导入邀请。`machine list` 支持可选的 `--json` 供脚本使用，并标明每条配置的 `ssh` 或 `relay` 传输类型。完整流程见[连接机器](/zh-cn/docs/connecting-machines/)。
 
 `machine add` 会检查远程 Herdr 是否具备所需能力，仅在必要时征得批准后安装或更新，并在保存配置前启动指定会话的后台服务器。只要兼容，发行版本不必一致。需要批准安装或重启时，请在交互式终端中运行；设置失败或取消时不会保存配置。替换运行中的服务器需要明确批准，默认回答为 No；停止服务器会结束其窗格进程。`machine add` 不会隐式启用实验性实时交接。
 
@@ -80,6 +81,19 @@ herdr --machine "Build machine" worktree create --cwd /srv/project --branch revi
 请求和响应通过非交互式 SSH 传输 JSON API，API 内容不会被拼接到 SSH shell 命令中。不需要打开 TUI，也不会自动安装、启动或重启服务器。请更新本地 CLI 和远程 Herdr，并确保运行中的服务器 API 协议兼容。认证、连接或版本错误不会回退到 Local，连接失败后也不会自动重试请求。
 
 远程命令不会继承调用方的本地窗格 ID，请显式指定远程 ID。`--current` 不能引用本地窗格。远程 worktree 路径必须为绝对路径、`~` 或以 `~/` 开头（由服务器展开）；插件 link 路径必须为绝对路径。每次只操作一台机器，不包含合并列表或通过其他 TUI 连接转发的功能。
+
+## 加密 Relay 托管
+
+```bash
+herdr relay enable --url <wss-url> --label <label> [--session <name>]
+herdr relay disable
+herdr relay invite
+herdr relay devices [--json]
+herdr relay revoke <controller-public-key>
+herdr relay status [--json]
+```
+
+Relay 是面向 Linux/macOS 的实验性功能。需要的服务器会自动启动；支持此流程的运行中服务器无需重启即可应用启用、禁用和撤销。旧版 Relay 服务器需先更新。`relay status --json` 同时返回保存的配置、运行中服务器的连接状态和控制端数量。Relay 配置可作为 TUI 原生机器使用，但 `--machine` JSON API 转发目前仍仅支持 SSH 配置。
 
 ## Shell 补全
 

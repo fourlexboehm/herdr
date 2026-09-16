@@ -1,11 +1,69 @@
 ---
 title: Connecting machines
-description: Work across Local and saved SSH machines in one Herdr window, with shared agent navigation and independent reconnects.
+description: Work across Local, saved SSH machines, and experimental encrypted relay machines in one Herdr window.
 ---
 
 Keep your local work and remote agents in one Herdr window. Save an SSH machine once, then switch between its workspaces and Local without opening another client. The agent list includes connected machines, so you can see where work is running and which agent needs an answer.
 
-Each machine keeps its own Herdr server, sessions, and running processes. A lost connection to one machine does not disconnect the others.
+Each machine keeps its own Herdr server, sessions, and running processes. A lost connection to one machine does not disconnect the others. Saved SSH is the established path. The encrypted relay described below is experimental.
+
+## Encrypted relay through firewalls
+
+Relay machines let two Herdr installations connect when neither side can accept an inbound connection. The target and controller both make outbound WSS connections to a Cloudflare Worker. A hibernating Durable Object joins the live sockets, but the existing Herdr endpoint stream is encrypted end to end with Noise before it reaches the relay.
+
+This implementation is available on Linux and macOS. It is experimental, `snow` has not received a formal security audit, and the complete design has not received an independent review. Do not use it yet for high-risk remote access. Cloudflare can observe route use, connection timing, message sizes, and IP addresses even though it cannot decrypt Herdr traffic.
+
+### Deploy the relay
+
+The relay project is in `cloudflare/relay/`. Cloudflare's Free plan supports the SQLite-backed Durable Objects used here, but continuous terminal output can exhaust free daily request allowances. Check Cloudflare's current pricing and limits before relying on it.
+
+```bash
+cd cloudflare/relay
+npm ci
+npm run check
+npx wrangler deploy
+```
+
+Use the deployed Worker URL as WSS, for example `wss://herdr-relay.example.workers.dev`. A custom Worker domain is optional. Cloudflare Tunnel and an inbound port are not required.
+
+The Worker creates one Durable Object per random target route. It stores only a salted registration-capability verifier and bounded abuse counters. Hibernating socket attachments contain a role and connection ID. Herdr data, Noise keys, invitations, private device keys, and terminal history are not stored. Automatic invocation logs and traces are disabled because route IDs are carried in request paths.
+
+### Connect two devices
+
+Run this in a terminal on **both devices**, using the same relay URL:
+
+```bash
+herdr machine add-relay --url wss://herdr-relay.example.workers.dev
+```
+
+Each device prints its own private pairing code and waits for the other device's code. Copy A's code into B, press Enter, then copy B's code into A and press Enter. Use a trusted, private channel to transfer the codes. Herdr checks the encrypted connection and the remote endpoint before printing **Connected**.
+
+Setup enables outbound hosting and starts the selected Herdr server if needed. A running server with this setup support notices enable, disable, and re-enable changes without a restart. A server from an older relay build must first be updated. Existing hosting configuration keeps its selected session; first-time setup uses the current session (or `default`). Only that session registers the device's route.
+
+After the first setup, use `herdr machine add-relay` without `--url`. Add `--label "Studio"` to name the other device in your machine list. If setup fails or a code expires, run the command again on both devices and exchange fresh codes. Retrying the same target keeps its controller identity and avoids duplicate machine entries. Open clients retry the repaired machine automatically. A new machine stays disabled until its connection check succeeds.
+
+Codes expire after 15 minutes and authorize one controller static key. Pairing grants access to the session's terminals with the host account's permissions. The code is consumed only after encrypted key confirmation. Terminal input, surfaces, graphics, health checks, and endpoint methods then use the existing endpoint generation 1 protocol inside Noise encryption.
+
+For one-way access or scripts, `herdr relay enable --url <wss-url> --label <label>` enables a host, `herdr relay invite` prints an invitation, and `herdr machine add-relay < relay-invitation.txt` imports and checks it. Protect and delete any invitation files afterward; never put the code in a command argument.
+
+List or revoke target-side controller devices:
+
+```bash
+herdr relay devices
+herdr relay revoke <controller-public-key>
+herdr relay status
+```
+
+Revocation closes matching active sessions and blocks reconnects. `relay status --json` combines stored configuration with the running server's optional `capabilities.relay` status and active controller count; it reports no live runtime when the server is stopped. Removing a Relay machine on the controller deletes its local credential; disabling it keeps the credential for later.
+
+### Relay failure behavior
+
+- Temporary relay outages, a sleeping target, HTTP 429/503 responses, and network loss use bounded reconnect backoff and affect only that machine.
+- A revoked controller, wrong pinned target key, invalid invitation, or invalid local credential moves only that endpoint to Attention.
+- Relay and local bridge queues are bounded. Overload closes the affected connection instead of dropping or reordering endpoint bytes.
+- Cloudflare's hibernating WebSocket API does not expose buffered bytes or asynchronous send completion. The Durable Object keeps no userland payload queue and disconnects the failed recipient if `send()` throws; Herdr's bounded device-side queues provide the observable backpressure boundary.
+
+Relay profile metadata and credentials are stored in separate private versioned files. The profile includes the relay URL, opaque route, pinned target public key, session, and credential reference. Static private keys and invitation secrets never enter the machine catalog. The Cloudflare registration capability exists only in the target's private relay state.
 
 ## Before you connect
 
@@ -95,7 +153,7 @@ The UI uses the client's local theme, sidebar settings, and keybindings by defau
 
 Default agent rows show a `machine` token when multiple machines are present. Existing custom rows are preserved; add `machine` explicitly if you want that label in your layout. [Sidebar row layouts](/docs/configuration/#sidebar-row-layouts) also support conditional colors for machine labels.
 
-Workspace, tab, pane IDs, and agent names are scoped to one server. Two machines may both contain `w1:p1` or an agent named `reviewer`. Selecting a machine in the UI does not retarget CLI commands running in an existing pane: they still use that pane's inherited session and socket. For remote automation, use `herdr --machine <label-or-id> agent list`, then pass the same prefix when controlling those remote IDs. The CLI uses the saved profile's SSH target and session directly; it does not need an open TUI. Without `--machine`, existing session/socket routing is unchanged. See [CLI reference](/docs/cli-reference/#saved-ssh-machines) for supported commands, update requirements, and remote path rules.
+Workspace, tab, pane IDs, and agent names are scoped to one server. Two machines may both contain `w1:p1` or an agent named `reviewer`. Selecting a machine in the UI does not retarget CLI commands running in an existing pane: they still use that pane's inherited session and socket. For remote automation over SSH, use `herdr --machine <label-or-id> agent list`, then pass the same prefix when controlling those remote IDs. The CLI uses the saved SSH profile's target and session directly; it does not need an open TUI. `--machine` JSON API forwarding does not yet target Relay profiles. Without `--machine`, existing session/socket routing is unchanged. See [CLI reference](/docs/cli-reference/#saved-machines) for supported commands, update requirements, and remote path rules.
 
 ## Updates and saved data
 

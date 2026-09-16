@@ -27,4 +27,26 @@ pub struct ServerCapabilities {
     /// Whether this server supports endpoint health probes.
     #[serde(default)]
     pub health_check: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelayServerStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayConnectionStatus {
+    Disabled,
+    Connecting,
+    Online,
+    Attention,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RelayServerStatus {
+    /// Identifies the host configuration whose connection status is reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration_id: Option<String>,
+    pub status: RelayConnectionStatus,
+    pub controller_connections: usize,
 }

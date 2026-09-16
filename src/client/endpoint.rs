@@ -9,6 +9,7 @@ mod control;
 mod health;
 mod message_policy;
 mod registry;
+mod relay_catalog;
 mod supervisor;
 mod writer;
 
@@ -17,6 +18,7 @@ pub(crate) use catalog::*;
 pub(crate) use control::*;
 pub(crate) use message_policy::*;
 pub(crate) use registry::*;
+pub(crate) use relay_catalog::*;
 pub(crate) use supervisor::*;
 pub(crate) use writer::NativeEndpointTransport;
 
@@ -72,6 +74,7 @@ impl fmt::Display for ProfileId {
 pub(crate) enum ClientEndpointId {
     Local,
     Ssh(ProfileId),
+    Relay(ProfileId),
 }
 
 impl ClientEndpointId {
@@ -83,6 +86,22 @@ impl ClientEndpointId {
         match self {
             Self::Local => "local".into(),
             Self::Ssh(profile_id) => format!("ssh:{profile_id}"),
+            Self::Relay(profile_id) => format!("relay:{profile_id}"),
+        }
+    }
+
+    pub(crate) fn from_storage_key(value: &str) -> Result<Self, String> {
+        if value == "local" {
+            return Ok(Self::Local);
+        }
+        let (transport, id) = value
+            .split_once(':')
+            .ok_or("endpoint selection has an invalid storage key")?;
+        let id = ProfileId::parse(id)?;
+        match transport {
+            "ssh" => Ok(Self::Ssh(id)),
+            "relay" => Ok(Self::Relay(id)),
+            _ => Err("endpoint selection uses an unknown transport".into()),
         }
     }
 }
@@ -115,6 +134,12 @@ mod tests {
         assert_eq!(
             ClientEndpointId::Ssh(profile).storage_key(),
             "ssh:0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(
+            ClientEndpointId::from_storage_key("relay:0123456789abcdef0123456789abcdef")
+                .unwrap()
+                .storage_key(),
+            "relay:0123456789abcdef0123456789abcdef"
         );
     }
 }

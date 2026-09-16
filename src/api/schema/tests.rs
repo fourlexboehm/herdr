@@ -207,6 +207,16 @@ fn generated_protocol_schema_artifact_is_current() {
 }
 
 #[test]
+fn unknown_relay_status_is_forward_compatible() {
+    let status: RelayServerStatus = serde_json::from_value(serde_json::json!({
+        "status": "future_status",
+        "controller_connections": 0
+    }))
+    .unwrap();
+    assert_eq!(status.status, RelayConnectionStatus::Unknown);
+}
+
+#[test]
 fn request_round_trips_for_server_stop() {
     let request = Request {
         id: "req_stop".into(),
@@ -726,6 +736,7 @@ fn success_response_round_trips() {
                 endpoint_protocol_generation: Some(1),
                 surface_interest: true,
                 health_check: true,
+                relay: None,
             }),
         },
     };

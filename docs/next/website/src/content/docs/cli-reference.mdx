@@ -47,18 +47,19 @@ herdr api schema --output herdr-api.schema.json
 with the installed binary. Use `--json` for the full JSON Schema document, or
 `--output PATH` to write that document to a file.
 
-## Saved SSH machines
+## Saved machines
 
 ```bash
 herdr machine list
 herdr machine add workbox --label "Build machine"
+herdr machine add-relay [--url <wss-url>] [--label "Studio"]
 herdr machine rename <profile-id> --label "New name"
 herdr machine disable <profile-id>
 herdr machine enable <profile-id>
 herdr machine remove <profile-id>
 ```
 
-By default, `machine add` uses the remote default session. Add `--remote-session <name>` only for a named session. `machine list` accepts optional `--json` for scripts. See [Connecting machines](/docs/connecting-machines/) for the full setup and connection guide.
+By default, SSH `machine add` uses the remote default session. Add `--remote-session <name>` only for a named session. `machine add-relay` prints this device's pairing code and accepts the other device's code with Enter, then verifies the encrypted endpoint connection. Run it on both devices; `--url` is optional after initial setup. Redirected-stdin invitation imports remain supported; never put the code in a command argument. `machine list` identifies each profile's `ssh` or `relay` transport and accepts optional `--json` for scripts. See [Connecting machines](/docs/connecting-machines/) for both setup paths.
 
 `machine add` checks the remote installation's capabilities, installs or updates with approval only when needed, and starts the requested session's background server before saving. Compatible release versions do not need to match. Run setup in an interactive terminal when installation or restart approval is required; failed or cancelled setup does not save a profile. Replacing a running server requires explicit approval with a default answer of No, and stops its pane processes. `machine add` never enables experimental handoff implicitly.
 
@@ -66,7 +67,7 @@ Changes apply automatically to open local Herdr clients, normally within a secon
 
 Automatic connections and reconnects are non-interactive. If a host key, password, key passphrase, MFA step, install, update, or restart needs approval, the machine shows Attention instead of opening a hidden prompt. Run the standalone command printed by Herdr, such as `herdr --remote workbox`, to complete that setup in the foreground, then restart the client. Include `--session <name>` only when the profile targets a named session.
 
-Workspace, tab, pane IDs, and agent names belong to a single server. Selecting a machine in the UI does not retarget CLI commands. Use the global **prefix** `--machine <label-or-id>` to route API commands to a saved SSH machine:
+Workspace, tab, pane IDs, and agent names belong to a single server. Selecting a machine in the UI does not retarget CLI commands. Use the global **prefix** `--machine <label-or-id>` to route API commands to a saved SSH machine. Relay profiles currently participate in the native TUI endpoint surface but not this JSON API forwarding prefix:
 
 ```bash
 herdr --machine "Build machine" agent list
@@ -82,6 +83,21 @@ Supported commands are `workspace`, `worktree`, `tab`, `pane`, `notification`, `
 Requests and responses travel through the JSON API over non-interactive SSH; API payloads are not interpolated into the SSH shell command. No open TUI is required, and the bridge never installs, starts, or restarts a server. Update the local CLI and remote Herdr installation to support machine forwarding, and keep the running remote server's API protocol compatible. Authentication, unavailable machines, and incompatible versions fail without falling back to Local. Requests are not automatically retried after connection failure.
 
 Local pane IDs are not inherited by remote commands. Use explicit remote IDs; `--current` cannot refer to the caller's local pane. Remote worktree paths must be absolute, `~`, or start with `~/` (expanded on the server); plugin link paths must be absolute. The prefix targets one machine at a time; combined listings and routing through another TUI's connections are not included.
+
+## Encrypted relay hosting
+
+```bash
+herdr relay enable --url <wss-url> --label <label> [--session <name>]
+herdr relay disable
+herdr relay invite
+herdr relay devices [--json]
+herdr relay revoke <controller-public-key>
+herdr relay status [--json]
+```
+
+`relay enable` creates a private static device identity, random route, and independent relay-registration capability when the target has no relay state. It starts the configured server if needed and waits for relay hosting to become ready. Updated running servers apply enable, disable, and re-enable changes without restarting. `relay invite` writes a one-use 15-minute invitation to stdout and a warning to stderr. `relay devices` exposes controller labels, roles, public keys, and pairing times; `relay revoke` removes one key and active relay hosting disconnects it on the next authorization refresh.
+
+The feature is experimental and Linux/macOS-first. See [Encrypted relay through firewalls](/docs/connecting-machines/#encrypted-relay-through-firewalls) for deployment, pairing, security limits, and Cloudflare Free-plan behavior.
 
 ## Shell completions
 

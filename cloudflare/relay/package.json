@@ -1,0 +1,34 @@
+{
+  "name": "@herdr/cloudflare-relay",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@12.0.2",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "check": "npm run types:check && npm run lint && npm run typecheck && npm test",
+    "deploy:dry-run": "wrangler deploy --dry-run --outdir dist",
+    "lint": "eslint src test vitest.config.ts --max-warnings 0",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "types": "wrangler types",
+    "types:check": "wrangler types --check"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.1.10",
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22.20.3",
+    "eslint": "^10.10.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.70.0",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.132.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.1": true,
+    "workerd@1.20260915.1": true,
+    "fsevents@2.3.3": true
+  }
+}

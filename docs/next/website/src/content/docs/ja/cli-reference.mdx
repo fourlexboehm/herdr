@@ -45,18 +45,19 @@ herdr api schema --output herdr-api.schema.json
 
 `herdr api schema` は、インストール済みバイナリに同梱されたソケットプロトコルスキーマの短い概要を表示します。完全な JSON Schema ドキュメントが欲しいときは `--json` を使い、ファイルに書き出すには `--output PATH` を使ってください。
 
-## 保存済み SSH マシン
+## 保存済みマシン
 
 ```bash
 herdr machine list
 herdr machine add workbox --label "Build machine"
+herdr machine add-relay --label "Studio" < relay-invitation.txt
 herdr machine rename <profile-id> --label "New name"
 herdr machine disable <profile-id>
 herdr machine enable <profile-id>
 herdr machine remove <profile-id>
 ```
 
-`machine add` はリモートのデフォルトセッションを使います。名前付きセッションを使う場合だけ `--remote-session <name>` を追加します。スクリプトでは `machine list` に `--json` を追加できます。詳しくは[マシンへの接続](/ja/docs/connecting-machines/)を参照してください。
+`machine add` はリモートのデフォルトセッションを使います。名前付きセッションを使う場合だけ `--remote-session <name>` を追加します。`machine add-relay` は自分のコードを表示し、相手のコードを貼り付けて Enter を押すと暗号化接続を確認します。両方のデバイスで実行し、初回は `--url` を指定します。標準入力からの招待インポートも引き続き使えます。スクリプトでは `machine list` に `--json` を追加でき、各行は `ssh` または `relay` を示します。詳しくは[マシンへの接続](/ja/docs/connecting-machines/)を参照してください。
 
 `machine add` はリモート側の Herdr が必要な機能を備えているか確認し、必要な場合だけ承認を得てインストールまたは更新します。指定したセッションのバックグラウンドサーバーを起動してからプロファイルを保存します。互換性があればリリースバージョンは一致しなくてもかまいません。インストールや再起動の承認が必要な場合は、対話型ターミナルで実行してください。セットアップが失敗またはキャンセルされた場合、プロファイルは保存されません。実行中サーバーの置き換えには明示的な承認が必要で、デフォルトの回答は No です。停止するとペインのプロセスも終了します。`machine add` は実験的なハンドオフを暗黙に有効にしません。
 
@@ -80,6 +81,19 @@ herdr --machine "Build machine" worktree create --cwd /srv/project --branch revi
 JSON API を非対話 SSH で転送します。API の内容を SSH のシェルコマンドに埋め込むことはありません。開いた TUI は不要で、サーバーのインストール・起動・再起動も自動では行いません。ローカル CLI とリモート Herdr を更新し、実行中サーバーの API プロトコルとの互換性を保ってください。認証、接続、互換性のエラーで Local にフォールバックしたり、要求を自動再送したりすることはありません。
 
 呼び出し元のローカルペイン ID は継承しません。リモート ID を明示してください。`--current` でローカルペインを指定することはできません。リモート worktree パスには絶対パス、`~`、または `~/` で始まるパスを指定します（サーバー側で展開）。プラグインの link パスは絶対パスが必要です。対象は 1 台ずつで、一覧の統合や別の TUI の接続を使った転送は含みません。
+
+## 暗号化 Relay ホスティング
+
+```bash
+herdr relay enable --url <wss-url> --label <label> [--session <name>]
+herdr relay disable
+herdr relay invite
+herdr relay devices [--json]
+herdr relay revoke <controller-public-key>
+herdr relay status [--json]
+```
+
+Relay は実験的で Linux/macOS 向けです。必要なサーバーは自動起動します。この設定に対応した実行中サーバーは、有効化・無効化・失効を再起動せずに反映します。古い Relay ビルドのサーバーは先に更新してください。`relay status --json` は保存済み設定に加えて、実行中サーバーの接続状態とコントローラー数を返します。Relay プロファイルは TUI のネイティブマシンとして動作しますが、`--machine` による JSON API 転送は現在 SSH プロファイル専用です。
 
 ## シェル補完
 

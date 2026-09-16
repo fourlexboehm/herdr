@@ -5,13 +5,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use super::ProfileId;
+use super::{ClientEndpointId, ProfileId, RelayEndpointCatalog, SavedRelayEndpoint};
 
 const CATALOG_VERSION: u32 = 1;
-const SELECTION_VERSION: u32 = 1;
-const MAX_CATALOG_BYTES: u64 = 64 * 1024;
-const MAX_PROFILES: usize = 64;
-const MAX_LABEL_BYTES: usize = 128;
+const SELECTION_VERSION: u32 = 2;
+pub(super) const MAX_CATALOG_BYTES: u64 = 64 * 1024;
+pub(super) const MAX_PROFILES: usize = 64;
+pub(super) const MAX_LABEL_BYTES: usize = 128;
 const MAX_TARGET_BYTES: usize = 1024;
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 
@@ -75,51 +75,129 @@ impl SavedSshEndpoint {
 #[serde(deny_unknown_fields)]
 pub(crate) struct EndpointCatalog {
     version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) selected_profile: Option<ProfileId>,
+    // Version 1 wrote selection into this file before selection became
+    // client-local. Read it for downgrade compatibility but never write it.
+    #[serde(
+        default,
+        rename = "selected_profile",
+        skip_serializing_if = "Option::is_none"
+    )]
+    legacy_selected_profile: Option<ProfileId>,
     #[serde(default)]
     pub(crate) ssh: Vec<SavedSshEndpoint>,
+    #[serde(skip)]
+    pub(crate) relay: Vec<SavedRelayEndpoint>,
+    #[serde(skip)]
+    pub(crate) selected_endpoint: Option<ClientEndpointId>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EndpointSelectionV1 {
+    version: u32,
+    selected_profile: Option<ProfileId>,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EndpointSelection {
+struct EndpointSelectionV2 {
     version: u32,
-    selected_profile: Option<ProfileId>,
+    selected_endpoint: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct EndpointProfiles {
+    pub(crate) ssh: Vec<SavedSshEndpoint>,
+    pub(crate) relay: Vec<SavedRelayEndpoint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SavedEndpointProfile {
+    pub(crate) endpoint_id: ClientEndpointId,
+    pub(crate) label: String,
+    pub(crate) enabled: bool,
 }
 
 impl Default for EndpointCatalog {
     fn default() -> Self {
         Self {
             version: CATALOG_VERSION,
-            selected_profile: None,
+            legacy_selected_profile: None,
             ssh: Vec::new(),
+            relay: Vec::new(),
+            selected_endpoint: None,
         }
     }
 }
 
 impl EndpointCatalog {
     pub(crate) fn load() -> Result<Self, String> {
-        Self::load_from_paths(&catalog_path(), &selection_path())
+        Self::load_from_paths(
+            &catalog_path(),
+            &super::relay_catalog_path(),
+            &selection_path(),
+        )
     }
 
-    pub(crate) fn load_profiles() -> Result<Vec<SavedSshEndpoint>, String> {
-        // Live clients keep their own selection, independent of other attached clients.
-        Self::load_from_path(&catalog_path()).map(|catalog| catalog.ssh)
+    pub(crate) fn load_for_client() -> Self {
+        Self::load_resilient_from_paths(
+            &catalog_path(),
+            &super::relay_catalog_path(),
+            &selection_path(),
+        )
     }
 
-    fn load_from_paths(catalog_path: &Path, selection_path: &Path) -> Result<Self, String> {
+    pub(crate) fn load_ssh_profiles() -> Result<Vec<SavedSshEndpoint>, String> {
+        Ok(Self::load_from_path(&catalog_path())?.ssh)
+    }
+
+    pub(crate) fn load_relay_profiles() -> Result<Vec<SavedRelayEndpoint>, String> {
+        Ok(RelayEndpointCatalog::load()?.relay)
+    }
+
+    fn load_from_paths(
+        catalog_path: &Path,
+        relay_catalog_path: &Path,
+        selection_path: &Path,
+    ) -> Result<Self, String> {
         let mut catalog = Self::load_from_path(catalog_path)?;
+        catalog.relay = RelayEndpointCatalog::load_from_path(relay_catalog_path)?.relay;
+        catalog.apply_selection_from_path(selection_path);
+        Ok(catalog)
+    }
+
+    fn load_resilient_from_paths(
+        catalog_path: &Path,
+        relay_catalog_path: &Path,
+        selection_path: &Path,
+    ) -> Self {
+        let mut catalog = Self::load_from_path(catalog_path).unwrap_or_else(|error| {
+            tracing::warn!(
+                %error,
+                path = %catalog_path.display(),
+                "saved SSH endpoint catalog is unavailable"
+            );
+            Self::default()
+        });
+        catalog.relay = RelayEndpointCatalog::load_from_path(relay_catalog_path)
+            .map(|catalog| catalog.relay)
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    %error,
+                    path = %relay_catalog_path.display(),
+                    "saved Relay endpoint catalog is unavailable"
+                );
+                Vec::new()
+            });
+        catalog.apply_selection_from_path(selection_path);
+        catalog
+    }
+
+    fn apply_selection_from_path(&mut self, selection_path: &Path) {
         match load_selection_from_path(selection_path) {
-            Ok(Some(selection)) => {
-                let valid = selection.selected_profile.as_ref().is_none_or(|selected| {
-                    catalog
-                        .ssh
-                        .iter()
-                        .any(|profile| &profile.id == selected && profile.enabled)
-                });
-                if valid {
-                    catalog.selected_profile = selection.selected_profile;
+            Ok(Some(selected)) => {
+                if self.endpoint_enabled(&selected) {
+                    self.selected_endpoint = (!selected.is_local()).then_some(selected);
                 } else {
                     tracing::warn!(
                         path = %selection_path.display(),
@@ -136,11 +214,60 @@ impl EndpointCatalog {
                 );
             }
         }
-        Ok(catalog)
+        if self.selected_endpoint.is_none() {
+            if let Some(legacy) = self.legacy_selected_profile.take() {
+                let endpoint = ClientEndpointId::Ssh(legacy);
+                if self.endpoint_enabled(&endpoint) {
+                    self.selected_endpoint = Some(endpoint);
+                }
+            }
+        }
     }
 
     pub(crate) fn store_profiles(&self) -> Result<(), String> {
         self.store_to_path(&catalog_path())
+    }
+
+    pub(crate) fn store_relay_profiles(&self) -> Result<(), String> {
+        RelayEndpointCatalog {
+            version: super::relay_catalog::RELAY_CATALOG_VERSION,
+            relay: self.relay.clone(),
+        }
+        .store()
+    }
+
+    pub(crate) fn add_relay(&mut self, profile: SavedRelayEndpoint) -> Result<ProfileId, String> {
+        let mut catalog = RelayEndpointCatalog {
+            version: super::relay_catalog::RELAY_CATALOG_VERSION,
+            relay: std::mem::take(&mut self.relay),
+        };
+        let result = catalog.add(profile);
+        self.relay = catalog.relay;
+        result
+    }
+
+    pub(crate) fn rename_relay(
+        &mut self,
+        id: &ProfileId,
+        label: impl Into<String>,
+    ) -> Result<bool, String> {
+        let Some(index) = self.relay.iter().position(|profile| &profile.id == id) else {
+            return Ok(false);
+        };
+        let mut renamed = self.relay[index].clone();
+        renamed.label = label.into();
+        renamed.validate()?;
+        self.relay[index] = renamed;
+        Ok(true)
+    }
+
+    pub(crate) fn remove_relay(&mut self, id: &ProfileId) -> Option<SavedRelayEndpoint> {
+        let index = self.relay.iter().position(|profile| &profile.id == id)?;
+        let removed = self.relay.remove(index);
+        if self.selected_endpoint.as_ref() == Some(&ClientEndpointId::Relay(id.clone())) {
+            self.selected_endpoint = None;
+        }
+        Some(removed)
     }
 
     pub(crate) fn store_selection(&self) -> Result<(), String> {
@@ -149,9 +276,12 @@ impl EndpointCatalog {
 
     fn store_selection_to_path(&self, path: &Path) -> Result<(), String> {
         self.validate()?;
-        let content = serde_json::to_vec_pretty(&EndpointSelection {
+        let content = serde_json::to_vec_pretty(&EndpointSelectionV2 {
             version: SELECTION_VERSION,
-            selected_profile: self.selected_profile.clone(),
+            selected_endpoint: self
+                .selected_endpoint
+                .as_ref()
+                .map(ClientEndpointId::storage_key),
         })
         .map_err(|error| format!("failed to encode endpoint selection: {error}"))?;
         store_private_json(path, &content, "endpoint selection")
@@ -190,14 +320,14 @@ impl EndpointCatalog {
     pub(crate) fn remove_ssh(&mut self, id: &ProfileId) -> bool {
         let previous_len = self.ssh.len();
         self.ssh.retain(|profile| &profile.id != id);
-        if self.selected_profile.as_ref() == Some(id) {
-            self.selected_profile = None;
+        if self.selected_endpoint.as_ref() == Some(&ClientEndpointId::Ssh(id.clone())) {
+            self.selected_endpoint = None;
         }
         self.ssh.len() != previous_len
     }
 
     pub(crate) fn select_local(&mut self) {
-        self.selected_profile = None;
+        self.selected_endpoint = None;
     }
 
     pub(crate) fn select_endpoint(&mut self, endpoint_id: &super::ClientEndpointId) -> bool {
@@ -207,6 +337,7 @@ impl EndpointCatalog {
                 true
             }
             super::ClientEndpointId::Ssh(profile_id) => self.select_ssh(profile_id),
+            super::ClientEndpointId::Relay(profile_id) => self.select_relay(profile_id),
         }
     }
 
@@ -218,14 +349,58 @@ impl EndpointCatalog {
         {
             return false;
         }
-        self.selected_profile = Some(id.clone());
+        self.selected_endpoint = Some(ClientEndpointId::Ssh(id.clone()));
         true
     }
 
-    pub(crate) fn has_enabled_ssh(&self) -> bool {
-        self.ssh.iter().any(|profile| profile.enabled)
+    pub(crate) fn select_relay(&mut self, id: &ProfileId) -> bool {
+        if !self
+            .relay
+            .iter()
+            .any(|profile| &profile.id == id && profile.enabled)
+        {
+            return false;
+        }
+        self.selected_endpoint = Some(ClientEndpointId::Relay(id.clone()));
+        true
     }
 
+    pub(crate) fn has_enabled_remote(&self) -> bool {
+        self.ssh.iter().any(|profile| profile.enabled)
+            || self.relay.iter().any(|profile| profile.enabled)
+    }
+
+    pub(crate) fn endpoint_profiles(&self) -> Vec<SavedEndpointProfile> {
+        self.ssh
+            .iter()
+            .map(|profile| SavedEndpointProfile {
+                endpoint_id: ClientEndpointId::Ssh(profile.id.clone()),
+                label: profile.label.clone(),
+                enabled: profile.enabled,
+            })
+            .chain(self.relay.iter().map(|profile| SavedEndpointProfile {
+                endpoint_id: ClientEndpointId::Relay(profile.id.clone()),
+                label: profile.label.clone(),
+                enabled: profile.enabled,
+            }))
+            .collect()
+    }
+
+    pub(crate) fn endpoint_enabled(&self, endpoint: &ClientEndpointId) -> bool {
+        match endpoint {
+            ClientEndpointId::Local => true,
+            ClientEndpointId::Ssh(id) => self
+                .ssh
+                .iter()
+                .any(|profile| &profile.id == id && profile.enabled),
+            ClientEndpointId::Relay(id) => self
+                .relay
+                .iter()
+                .any(|profile| &profile.id == id && profile.enabled),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn contains_enabled_target_session(&self, target: &str, session: &str) -> bool {
         self.ssh.iter().any(|profile| {
             profile.enabled && profile.target == target && profile.session == session
@@ -237,8 +412,20 @@ impl EndpointCatalog {
             return false;
         };
         profile.enabled = enabled;
-        if !enabled && self.selected_profile.as_ref() == Some(id) {
-            self.selected_profile = None;
+        if !enabled && self.selected_endpoint.as_ref() == Some(&ClientEndpointId::Ssh(id.clone())) {
+            self.selected_endpoint = None;
+        }
+        true
+    }
+
+    pub(crate) fn set_relay_enabled(&mut self, id: &ProfileId, enabled: bool) -> bool {
+        let Some(profile) = self.relay.iter_mut().find(|profile| &profile.id == id) else {
+            return false;
+        };
+        profile.enabled = enabled;
+        if !enabled && self.selected_endpoint.as_ref() == Some(&ClientEndpointId::Relay(id.clone()))
+        {
+            self.selected_endpoint = None;
         }
         true
     }
@@ -262,13 +449,19 @@ impl EndpointCatalog {
                 return Err(format!("duplicate endpoint profile id {}", profile.id));
             }
         }
-        if self.selected_profile.as_ref().is_some_and(|selected| {
-            !self
-                .ssh
-                .iter()
-                .any(|profile| &profile.id == selected && profile.enabled)
-        }) {
-            return Err("selected SSH endpoint is absent or disabled in the catalog".into());
+        let mut relay_ids = HashSet::new();
+        for profile in &self.relay {
+            profile.validate()?;
+            if !relay_ids.insert(profile.id.clone()) || ids.contains(&profile.id) {
+                return Err(format!("duplicate endpoint profile id {}", profile.id));
+            }
+        }
+        if self
+            .selected_endpoint
+            .as_ref()
+            .is_some_and(|selected| !self.endpoint_enabled(selected))
+        {
+            return Err("selected endpoint is absent or disabled in its catalog".into());
         }
         Ok(())
     }
@@ -311,7 +504,7 @@ impl EndpointCatalog {
     }
 }
 
-fn load_selection_from_path(path: &Path) -> Result<Option<EndpointSelection>, String> {
+fn load_selection_from_path(path: &Path) -> Result<Option<ClientEndpointId>, String> {
     let content = match std::fs::read(path) {
         Ok(content) => content,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -320,18 +513,38 @@ fn load_selection_from_path(path: &Path) -> Result<Option<EndpointSelection>, St
     if content.len() as u64 > MAX_CATALOG_BYTES {
         return Err("endpoint selection exceeds the storage limit".into());
     }
-    let selection: EndpointSelection = serde_json::from_slice(&content)
+    let value: serde_json::Value = serde_json::from_slice(&content)
         .map_err(|error| format!("stored endpoint selection is invalid: {error}"))?;
-    if selection.version != SELECTION_VERSION {
-        return Err(format!(
-            "unsupported endpoint selection version {}; expected {SELECTION_VERSION}",
-            selection.version
-        ));
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("stored endpoint selection has no version")?;
+    match version {
+        1 => {
+            let selection: EndpointSelectionV1 = serde_json::from_value(value)
+                .map_err(|error| format!("stored endpoint selection is invalid: {error}"))?;
+            debug_assert_eq!(selection.version, 1);
+            Ok(selection.selected_profile.map(ClientEndpointId::Ssh))
+        }
+        found if found == u64::from(SELECTION_VERSION) => {
+            let selection: EndpointSelectionV2 = serde_json::from_value(value)
+                .map_err(|error| format!("stored endpoint selection is invalid: {error}"))?;
+            match selection.selected_endpoint {
+                Some(key) => ClientEndpointId::from_storage_key(&key).map(Some),
+                None => Ok(None),
+            }
+        }
+        _ => Err(format!(
+            "unsupported endpoint selection version {version}; expected 1 or {SELECTION_VERSION}"
+        )),
     }
-    Ok(Some(selection))
 }
 
-fn store_private_json(path: &Path, content: &[u8], description: &str) -> Result<(), String> {
+pub(super) fn store_private_json(
+    path: &Path,
+    content: &[u8],
+    description: &str,
+) -> Result<(), String> {
     if content.len() as u64 > MAX_CATALOG_BYTES {
         return Err(format!("{description} exceeds the storage limit"));
     }
@@ -407,9 +620,57 @@ mod tests {
         assert!(!encoded.contains("private_key"));
         assert!(!encoded.contains("control_socket"));
         let loaded = EndpointCatalog::load_from_path(&path).unwrap();
-        assert_eq!(loaded, catalog);
+        assert_eq!(loaded.ssh, catalog.ssh);
+        assert_eq!(loaded.selected_endpoint, None);
         assert_eq!(loaded.ssh[0].id, id);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn relay_selection_survives_restart_and_does_not_block_ssh_writes() {
+        let root = path("relay-selection");
+        let catalog_path = root.clone();
+        let relay_path = root.with_file_name("relay.json");
+        let selection_path = root.with_file_name("selection.json");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+
+        let mut host =
+            crate::relay::store::RelayHostState::create("wss://relay.example", "Studio", "default")
+                .unwrap();
+        let invitation = host.create_invitation().unwrap();
+        let relay = SavedRelayEndpoint::from_invitation(&invitation, "credential").unwrap();
+        let relay_id = relay.id.clone();
+
+        let mut catalog = EndpointCatalog::default();
+        let ssh_id = catalog.add_ssh("Build", "build", "default").unwrap();
+        catalog.add_relay(relay).unwrap();
+        assert!(catalog.select_relay(&relay_id));
+        catalog.store_to_path(&catalog_path).unwrap();
+        RelayEndpointCatalog {
+            version: super::super::relay_catalog::RELAY_CATALOG_VERSION,
+            relay: catalog.relay.clone(),
+        }
+        .store_to_path(&relay_path)
+        .unwrap();
+        catalog.store_selection_to_path(&selection_path).unwrap();
+
+        let mut loaded =
+            EndpointCatalog::load_from_paths(&catalog_path, &relay_path, &selection_path).unwrap();
+        assert_eq!(
+            loaded.selected_endpoint,
+            Some(ClientEndpointId::Relay(relay_id))
+        );
+        assert!(loaded.rename_ssh(&ssh_id, "Builder").unwrap());
+        loaded.store_to_path(&catalog_path).unwrap();
+        assert_eq!(
+            loaded
+                .selected_endpoint
+                .as_ref()
+                .map(ClientEndpointId::storage_key),
+            Some(format!("relay:{}", loaded.relay[0].id))
+        );
+
+        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -466,12 +727,12 @@ mod tests {
         let first = catalog.add_ssh("One", "one", "default").unwrap();
         assert!(catalog.select_ssh(&first));
         assert!(catalog.set_enabled(&first, false));
-        assert_eq!(catalog.selected_profile, None);
+        assert_eq!(catalog.selected_endpoint, None);
 
         assert!(catalog.set_enabled(&first, true));
         assert!(catalog.select_ssh(&first));
         assert!(catalog.remove_ssh(&first));
-        assert_eq!(catalog.selected_profile, None);
+        assert_eq!(catalog.selected_endpoint, None);
     }
 
     #[test]
@@ -515,11 +776,8 @@ mod tests {
 
         assert_eq!(std::fs::read(&catalog_path).unwrap(), profiles_before);
         assert_eq!(
-            load_selection_from_path(&selection_path)
-                .unwrap()
-                .unwrap()
-                .selected_profile,
-            Some(id)
+            load_selection_from_path(&selection_path).unwrap(),
+            Some(ClientEndpointId::Ssh(id))
         );
         std::fs::remove_dir_all(catalog_path.parent().unwrap()).unwrap();
     }
@@ -534,11 +792,65 @@ mod tests {
         catalog.store_to_path(&catalog_path).unwrap();
         std::fs::write(&selection_path, b"not json").unwrap();
 
-        let loaded = EndpointCatalog::load_from_paths(&catalog_path, &selection_path).unwrap();
+        let relay_path = catalog_path.with_file_name("relay.json");
+        let loaded =
+            EndpointCatalog::load_from_paths(&catalog_path, &relay_path, &selection_path).unwrap();
         assert_eq!(loaded.ssh.len(), 1);
         assert_eq!(loaded.ssh[0].id, id);
-        assert_eq!(loaded.selected_profile, None);
+        assert_eq!(loaded.selected_endpoint, None);
         std::fs::remove_dir_all(catalog_path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn malformed_relay_catalog_does_not_discard_ssh_profiles_at_startup() {
+        let root = path("malformed-relay-startup");
+        let catalog_path = root.clone();
+        let relay_path = root.with_file_name("relay.json");
+        let selection_path = root.with_file_name("selection.json");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+
+        let mut catalog = EndpointCatalog::default();
+        let ssh_id = catalog.add_ssh("Build", "build", "default").unwrap();
+        catalog.store_to_path(&catalog_path).unwrap();
+        std::fs::write(&relay_path, b"not json").unwrap();
+
+        let loaded =
+            EndpointCatalog::load_resilient_from_paths(&catalog_path, &relay_path, &selection_path);
+        assert_eq!(loaded.ssh.len(), 1);
+        assert_eq!(loaded.ssh[0].id, ssh_id);
+        assert!(loaded.relay.is_empty());
+
+        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn malformed_ssh_catalog_does_not_discard_relay_profiles_at_startup() {
+        let root = path("malformed-ssh-startup");
+        let catalog_path = root.clone();
+        let relay_path = root.with_file_name("relay.json");
+        let selection_path = root.with_file_name("selection.json");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+
+        std::fs::create_dir_all(root.parent().unwrap()).unwrap();
+        std::fs::write(&catalog_path, b"not json").unwrap();
+        let mut host =
+            crate::relay::store::RelayHostState::create("wss://relay.example", "Studio", "default")
+                .unwrap();
+        let invitation = host.create_invitation().unwrap();
+        let relay = SavedRelayEndpoint::from_invitation(&invitation, "credential").unwrap();
+        RelayEndpointCatalog {
+            version: super::super::relay_catalog::RELAY_CATALOG_VERSION,
+            relay: vec![relay.clone()],
+        }
+        .store_to_path(&relay_path)
+        .unwrap();
+
+        let loaded =
+            EndpointCatalog::load_resilient_from_paths(&catalog_path, &relay_path, &selection_path);
+        assert!(loaded.ssh.is_empty());
+        assert_eq!(loaded.relay, vec![relay]);
+
+        std::fs::remove_dir_all(root.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -552,25 +864,29 @@ mod tests {
         let missing = ProfileId::parse("fedcba9876543210fedcba9876543210").unwrap();
         store_private_json(
             &selection_path,
-            &serde_json::to_vec(&EndpointSelection {
+            &serde_json::to_vec(&EndpointSelectionV2 {
                 version: SELECTION_VERSION,
-                selected_profile: Some(missing),
+                selected_endpoint: Some(ClientEndpointId::Ssh(missing).storage_key()),
             })
             .unwrap(),
             "endpoint selection",
         )
         .unwrap();
 
-        let loaded = EndpointCatalog::load_from_paths(&catalog_path, &selection_path).unwrap();
+        let relay_path = catalog_path.with_file_name("relay.json");
+        let loaded =
+            EndpointCatalog::load_from_paths(&catalog_path, &relay_path, &selection_path).unwrap();
         assert_eq!(loaded.ssh[0].id, saved);
-        assert_eq!(loaded.selected_profile, None);
+        assert_eq!(loaded.selected_endpoint, None);
         std::fs::remove_dir_all(catalog_path.parent().unwrap()).unwrap();
     }
 
     #[test]
     fn invalid_or_missing_selected_profile_is_rejected() {
         let catalog = EndpointCatalog {
-            selected_profile: Some(ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap()),
+            selected_endpoint: Some(ClientEndpointId::Ssh(
+                ProfileId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+            )),
             ..EndpointCatalog::default()
         };
         assert!(catalog.validate().is_err());

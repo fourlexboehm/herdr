@@ -71,6 +71,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         endpoint_protocol_generation: Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION),
         surface_interest: true,
         health_check: true,
+        relay: None,
     })
 }
 
@@ -340,6 +341,10 @@ fn handle_request(
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
 ) -> String {
     if matches!(&request.method, Method::Ping(_)) {
+        let mut capabilities = capabilities;
+        if let Some(capabilities) = capabilities.as_mut() {
+            capabilities.relay = Some(crate::relay::transport::host_runtime_status());
+        }
         return serde_json::to_string(&SuccessResponse {
             id: request.id,
             result: ResponseResult::Pong {
@@ -1150,6 +1155,7 @@ mod tests {
                 ),
                 surface_interest: true,
                 health_check: true,
+                relay: None,
             }),
             None,
             None,

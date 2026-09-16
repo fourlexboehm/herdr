@@ -212,6 +212,18 @@ pub fn spawn_server_daemon() -> io::Result<u32> {
     Ok(pid)
 }
 
+/// Start the explicitly selected session without inheriting another session's sockets.
+pub(crate) fn spawn_server_daemon_for_session(session: &str) -> io::Result<u32> {
+    crate::session::parse_target_name(session)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let mut command = build_server_daemon_command(std::env::current_exe()?);
+    command
+        .env(crate::session::SESSION_ENV_VAR, session)
+        .env_remove(crate::api::SOCKET_PATH_ENV_VAR)
+        .env_remove("HERDR_CLIENT_SOCKET_PATH");
+    crate::platform::launch_server_daemon_command(&mut command)
+}
+
 fn build_server_daemon_command(exe: PathBuf) -> Command {
     let mut command = Command::new(&exe);
     command

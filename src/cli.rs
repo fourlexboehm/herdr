@@ -31,6 +31,8 @@ mod notification;
 mod pane;
 mod plugin;
 mod protocol_guard;
+mod relay;
+mod relay_setup;
 mod runtime;
 mod server;
 mod server_not_running;
@@ -120,6 +122,7 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
         "config" => run_config_command(&args[2..])?,
         "channel" => run_channel_command(&args[2..])?,
         "machine" => machine::run_machine_command(&args[2..])?,
+        "relay" => relay::run_relay_command(&args[2..])?,
         "workspace" => workspace::run_workspace_command(&args[2..])?,
         "worktree" => worktree::run_worktree_command(&args[2..])?,
         "tab" => tab::run_tab_command(&args[2..])?,
