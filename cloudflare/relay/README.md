@@ -1,8 +1,12 @@
 # Herdr Cloudflare relay
 
-This package is the opaque rendezvous layer for Herdr's experimental native
-end-to-end encrypted relay transport. It contains a front-door Worker and one
-SQLite-backed, hibernating `TargetRelay` Durable Object per target route.
+This package is the opaque rendezvous and signaling layer for Herdr's
+experimental native end-to-end encrypted peer transport. It contains a
+front-door Worker and one SQLite-backed, hibernating `TargetRelay` Durable
+Object per target route. Herdr peers use the WebSocket connection for Noise
+authentication, ICE signaling, and connection lifecycle. Endpoint traffic
+requires an ordered WebRTC data channel over direct ICE/STUN or TURN and never
+uses the WebSocket.
 
 The relay never parses Herdr or Noise messages and never persists traffic,
 keys, invitations, or raw registration capabilities. Structured logs contain
@@ -15,6 +19,8 @@ are disabled because route ids are carried in request paths.
 - `GET /v1/targets/{route_id}` with `Upgrade: websocket` and
   `Authorization: Bearer <registration_capability>`
 - `GET /v1/controllers/{route_id}` with `Upgrade: websocket`
+- `POST /v1/turn-credentials/{route_id}` with the target registration
+  capability
 
 Route ids and registration capabilities are independent unpadded base64url
 encodings of 32 random bytes. The first successful target registration stores
@@ -28,6 +34,24 @@ Subsequent target connections are checked against that verifier with a
 constant-time comparison. Controllers are intentionally unauthenticated by
 the relay; the end-to-end encrypted Herdr protocol authenticates them.
 
+The optional TURN endpoint never creates a route registration. After a target
+has registered, it can request two independent 24-hour Cloudflare TURN
+allocations for an authenticated controller connection. ICE tries direct paths
+first and uses TURN only when NAT or firewall behavior prevents them.
+
+Create a Cloudflare Realtime TURN key, then configure its ID and API token as
+Worker secrets:
+
+```bash
+npx wrangler secret put TURN_KEY_ID
+npx wrangler secret put TURN_KEY_API_TOKEN
+```
+
+Without both secrets, the endpoint returns `turn_not_configured`; Herdr still
+tries direct ICE/STUN, but the connection fails and retries if no direct path
+opens. The long-lived TURN API token is never returned to Herdr. Only the
+generated short-lived credentials cross the target-authenticated endpoint.
+
 Controllers are accepted only while the target is connected. A duplicate live
 target receives an HTTP 409 response and the existing target remains active.
 Each route accepts at most 16 controller connection attempts per minute and 16
@@ -38,10 +62,11 @@ reconnects use an independent rate budget.
 
 ## Relay protocol version 1
 
-Controller WebSocket application messages are opaque binary payloads no larger
-than 1 MiB. The relay wraps each controller frame in a target `data` envelope.
-Target `data` payloads are unwrapped and sent to the selected controller
-without interpretation.
+Controller WebSocket application messages are opaque binary handshake and
+signaling payloads no larger than 1 MiB. The relay wraps each controller frame
+in a target `data` envelope. Target `data` payloads are unwrapped and sent to
+the selected controller without interpretation. Herdr rejects WebSocket
+endpoint data after the peer transport activates.
 
 Every target WebSocket application message is a binary envelope:
 
@@ -59,18 +84,17 @@ may be empty. `close` and `notice` contain at most 512 bytes of valid UTF-8.
 Payload length is capped at 1 MiB and must exactly match the header.
 
 Hibernating sockets serialize only protocol version, role, and connection id.
-SQLite stores the salted target verifier and bounded connection-attempt
-counters only.
+SQLite stores the salted target verifier and bounded connection-attempt and
+TURN-credential request counters only. Peer configuration and SDP signaling
+are inside the end-to-end encrypted controller payloads and remain opaque to
+the Worker.
 
-## Cloudflare backpressure limitation
+## Data path
 
-The Hibernation WebSocket API exposes neither `bufferedAmount` nor an async
-send-completion signal. Because the Rust-facing controller stream permits only
-opaque binary data, the relay cannot add acknowledgement frames without
-changing the contract. It therefore keeps no userland message queue, forwards
-synchronously, and disconnects only the failed recipient when `WebSocket.send`
-throws. The 1 MiB payload limit remains enforced, but a separate byte limit on
-Cloudflare's internal socket buffer is not observable.
+The ordered, reliable WebRTC data channel owns endpoint delivery and
+backpressure. WebSocket messages stop after bounded authentication and ICE
+signaling, apart from protocol ping/pong and close lifecycle traffic. The
+Durable Object therefore never queues or forwards terminal output.
 
 ## Local validation
 

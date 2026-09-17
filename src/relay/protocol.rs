@@ -19,6 +19,7 @@ pub(crate) const MAX_RELAY_ENVELOPE: usize = ENVELOPE_HEADER_BYTES + MAX_RELAY_P
 const BATCH_LENGTH_BYTES: usize = 4;
 const HANDSHAKE_HEADER_BYTES: usize = 4;
 const SECURE_FRAME_HEADER_BYTES: usize = 5;
+const MAX_SECURE_CONTROL_PAYLOAD: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -227,6 +228,10 @@ pub(crate) enum SecureFrameKind {
     Data = 1,
     ClientConfirm = 2,
     ServerConfirm = 3,
+    P2pRequest = 4,
+    P2pConfig = 5,
+    P2pOffer = 6,
+    P2pAnswer = 7,
 }
 
 impl TryFrom<u8> for SecureFrameKind {
@@ -237,6 +242,10 @@ impl TryFrom<u8> for SecureFrameKind {
             1 => Ok(Self::Data),
             2 => Ok(Self::ClientConfirm),
             3 => Ok(Self::ServerConfirm),
+            4 => Ok(Self::P2pRequest),
+            5 => Ok(Self::P2pConfig),
+            6 => Ok(Self::P2pOffer),
+            7 => Ok(Self::P2pAnswer),
             _ => Err(invalid_data("unknown secure relay frame kind")),
         }
     }
@@ -246,11 +255,7 @@ pub(crate) fn encode_secure_frame(kind: SecureFrameKind, payload: &[u8]) -> io::
     if payload.len() > MAX_RELAY_PAYLOAD {
         return Err(invalid_data("secure relay frame exceeds the limit"));
     }
-    if kind != SecureFrameKind::Data && !payload.is_empty() {
-        return Err(invalid_data(
-            "secure relay confirmation frame must be empty",
-        ));
-    }
+    validate_secure_frame_payload(kind, payload)?;
     let len = u32::try_from(payload.len())
         .map_err(|_| invalid_data("secure frame length does not fit the wire format"))?;
     let mut frame = Vec::with_capacity(SECURE_FRAME_HEADER_BYTES + payload.len());
@@ -273,12 +278,34 @@ pub(crate) fn decode_secure_frame(encoded: &[u8]) -> io::Result<(SecureFrameKind
     if len > MAX_RELAY_PAYLOAD || encoded.len() != SECURE_FRAME_HEADER_BYTES + len {
         return Err(invalid_data("secure relay frame length mismatch"));
     }
-    if kind != SecureFrameKind::Data && len != 0 {
-        return Err(invalid_data(
-            "secure relay confirmation frame must be empty",
-        ));
-    }
+    validate_secure_frame_payload(kind, &encoded[SECURE_FRAME_HEADER_BYTES..])?;
     Ok((kind, &encoded[SECURE_FRAME_HEADER_BYTES..]))
+}
+
+fn validate_secure_frame_payload(kind: SecureFrameKind, payload: &[u8]) -> io::Result<()> {
+    match kind {
+        SecureFrameKind::Data => Ok(()),
+        SecureFrameKind::P2pConfig | SecureFrameKind::P2pOffer | SecureFrameKind::P2pAnswer
+            if !payload.is_empty() && payload.len() <= MAX_SECURE_CONTROL_PAYLOAD =>
+        {
+            Ok(())
+        }
+        SecureFrameKind::ClientConfirm
+        | SecureFrameKind::ServerConfirm
+        | SecureFrameKind::P2pRequest
+            if payload.is_empty() =>
+        {
+            Ok(())
+        }
+        SecureFrameKind::P2pConfig | SecureFrameKind::P2pOffer | SecureFrameKind::P2pAnswer => {
+            Err(invalid_data("invalid secure peer signaling payload"))
+        }
+        SecureFrameKind::ClientConfirm
+        | SecureFrameKind::ServerConfirm
+        | SecureFrameKind::P2pRequest => {
+            Err(invalid_data("secure relay control frame must be empty"))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -401,12 +428,29 @@ mod tests {
     }
 
     #[test]
-    fn secure_confirmation_frames_cannot_smuggle_endpoint_bytes() {
+    fn secure_control_frame_payload_rules_are_enforced() {
         let frame = encode_secure_frame(SecureFrameKind::ClientConfirm, &[]).unwrap();
         assert_eq!(
             decode_secure_frame(&frame).unwrap(),
             (SecureFrameKind::ClientConfirm, &[][..])
         );
-        assert!(encode_secure_frame(SecureFrameKind::ClientConfirm, b"data").is_err());
+        for kind in [
+            SecureFrameKind::ClientConfirm,
+            SecureFrameKind::ServerConfirm,
+            SecureFrameKind::P2pRequest,
+        ] {
+            assert!(encode_secure_frame(kind, &[]).is_ok());
+            assert!(encode_secure_frame(kind, b"data").is_err());
+        }
+        for kind in [
+            SecureFrameKind::P2pConfig,
+            SecureFrameKind::P2pOffer,
+            SecureFrameKind::P2pAnswer,
+        ] {
+            assert!(encode_secure_frame(kind, b"{}").is_ok());
+            assert!(encode_secure_frame(kind, &[]).is_err());
+            assert!(encode_secure_frame(kind, &vec![0; MAX_SECURE_CONTROL_PAYLOAD + 1]).is_err());
+        }
+        assert!(decode_secure_frame(&[8, 0, 0, 0, 0]).is_err());
     }
 }

@@ -9,7 +9,7 @@ description: 在一个 Herdr 窗口中使用 Local 和已保存的 SSH 机器，
 
 ## 穿过防火墙的加密 Relay
 
-实验性的 Relay 机器让目标端和控制端都向 Cloudflare Worker 建立出站 WSS 连接，因此目标端不需要开放入站端口，也不需要 Cloudflare Tunnel。Durable Object 只负责连接实时套接字；现有 Herdr endpoint generation 1 字节流会先用 Noise 做端到端加密。
+实验性的 Relay 机器让目标端和控制端都向 Cloudflare Worker 建立出站 WSS 连接，但仅用于会合、Noise 认证、ICE 信令和连接生命周期。Herdr 异步协商有序的 WebRTC 数据通道：ICE 优先使用 STUN 发现的直连 UDP 路径，在 NAT 或防火墙阻止直连时使用 TURN。endpoint 字节永不经过 WSS，并在选定的 WebRTC 路径上始终使用 Noise 端到端加密。目标端不需要开放入站端口，也不需要 Cloudflare Tunnel。
 
 该功能目前面向 Linux 和 macOS，尚未经过独立安全审计，请勿用于高风险远程访问。Cloudflare 无法解密 Herdr 内容，但仍可观察 IP 地址、连接时间和流量大小。
 
@@ -21,6 +21,15 @@ npm ci
 npm run check
 npx wrangler deploy
 ```
+
+WSS 信令和直连 ICE/STUN 无需其他服务即可工作。要在无法直连时可靠连接，请创建 Cloudflare Realtime TURN 密钥，并将其 ID 和 API 令牌添加为 Worker secrets：
+
+```bash
+npx wrangler secret put TURN_KEY_ID
+npx wrangler secret put TURN_KEY_API_TOKEN
+```
+
+TURN 有 Realtime 免费额度和用量定价；启用前请查看最新价格。Worker 只使用长期令牌为两端生成彼此独立的短期凭据。Herdr 会先尝试直连 UDP，因此仅在 ICE 需要中继时，endpoint 流量才经过 TURN。未配置 TURN 时仍可使用直连 ICE；如果无法建立 WebRTC 路径，连接会失败并重试，endpoint 字节不会改走 WSS。
 
 在两台设备的终端中使用同一个 Relay URL 运行：
 
@@ -42,7 +51,7 @@ herdr relay revoke <controller-public-key>
 herdr relay status
 ```
 
-Cloudflare Free 计划支持这里使用的 SQLite-backed Durable Objects，但持续的终端输出可能耗尽每日免费请求额度。Relay 不保存 Herdr 数据、Noise 密钥、邀请或终端历史；它只保存加盐的注册校验值和有界的防滥用计数器。
+Cloudflare Free 计划支持这里使用的 SQLite-backed Durable Objects。终端输出不经过 Durable Object，但 TURN 流量使用单独的 Realtime 计费。Relay 不保存 Herdr 数据、Noise 密钥、邀请、TURN 凭据、ICE 描述或终端历史；它只保存加盐的注册校验值和有界的防滥用计数器。ICE 配置和描述都封装在 Noise 密文中。
 
 ## 连接前的准备
 

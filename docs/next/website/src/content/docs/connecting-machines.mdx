@@ -9,13 +9,13 @@ Each machine keeps its own Herdr server, sessions, and running processes. A lost
 
 ## Encrypted relay through firewalls
 
-Relay machines let two Herdr installations connect when neither side can accept an inbound connection. The target and controller both make outbound WSS connections to a Cloudflare Worker. A hibernating Durable Object joins the live sockets, but the existing Herdr endpoint stream is encrypted end to end with Noise before it reaches the relay.
+Relay machines let two Herdr installations connect when neither side can accept an inbound connection. The target and controller both make outbound WSS connections to a Cloudflare Worker only for rendezvous, Noise authentication, ICE signaling, and connection lifecycle. Herdr asynchronously negotiates an ordered WebRTC data channel: ICE prefers a direct UDP path discovered with STUN and uses TURN when NAT or firewall behavior blocks direct traffic. Endpoint bytes never use WSS and remain encrypted end to end with Noise over the selected WebRTC path.
 
-This implementation is available on Linux and macOS. It is experimental, `snow` has not received a formal security audit, and the complete design has not received an independent review. Do not use it yet for high-risk remote access. Cloudflare can observe route use, connection timing, message sizes, and IP addresses even though it cannot decrypt Herdr traffic.
+This implementation is available on Linux and macOS. It is experimental, `snow` has not received a formal security audit, and the complete design has not received an independent review. Do not use it yet for high-risk remote access. Cloudflare can observe route use, connection timing, signaling message sizes, and IP addresses even though it cannot decrypt Herdr traffic.
 
 ### Deploy the relay
 
-The relay project is in `cloudflare/relay/`. Cloudflare's Free plan supports the SQLite-backed Durable Objects used here, but continuous terminal output can exhaust free daily request allowances. Check Cloudflare's current pricing and limits before relying on it.
+The signaling project is in `cloudflare/relay/`. Cloudflare's Free plan supports the SQLite-backed Durable Objects used here. Terminal output does not traverse the Durable Object, but TURN traffic has separate Realtime billing. Check Cloudflare's current pricing and limits before relying on it.
 
 ```bash
 cd cloudflare/relay
@@ -24,9 +24,18 @@ npm run check
 npx wrangler deploy
 ```
 
+WSS signaling and direct ICE/STUN work without additional services. For reliable connectivity when direct traversal fails, create a Cloudflare Realtime TURN key and add its ID and API token as Worker secrets:
+
+```bash
+npx wrangler secret put TURN_KEY_ID
+npx wrangler secret put TURN_KEY_API_TOKEN
+```
+
+TURN has a Realtime free tier and usage pricing; check the current pricing before enabling it. The Worker uses the long-lived token only to generate separate short-lived credentials for the two peers. Herdr tries direct UDP first, so a TURN allocation carries endpoint traffic only when ICE needs the relay. If TURN is not configured, direct ICE can still connect; if no WebRTC path opens, the attempt fails and retries without sending endpoint bytes over WSS.
+
 Use the deployed Worker URL as WSS, for example `wss://herdr-relay.example.workers.dev`. A custom Worker domain is optional. Cloudflare Tunnel and an inbound port are not required.
 
-The Worker creates one Durable Object per random target route. It stores only a salted registration-capability verifier and bounded abuse counters. Hibernating socket attachments contain a role and connection ID. Herdr data, Noise keys, invitations, private device keys, and terminal history are not stored. Automatic invocation logs and traces are disabled because route IDs are carried in request paths.
+The Worker creates one Durable Object per random target route. It stores only a salted registration-capability verifier and bounded abuse counters. Hibernating socket attachments contain a role and connection ID. Herdr data, Noise keys, invitations, private device keys, TURN credentials, ICE descriptions, and terminal history are not stored. ICE configuration and descriptions travel inside Noise ciphertext. Automatic invocation logs and traces are disabled because route IDs are carried in request paths.
 
 ### Connect two devices
 
@@ -59,9 +68,10 @@ Revocation closes matching active sessions and blocks reconnects. `relay status 
 ### Relay failure behavior
 
 - Temporary relay outages, a sleeping target, HTTP 429/503 responses, and network loss use bounded reconnect backoff and affect only that machine.
+- ICE/STUN/TURN setup is asynchronous and bounded. Direct UDP is preferred; if no WebRTC path opens, the attempt fails before endpoint bytes move. A failed active peer path reconnects only that controller.
 - A revoked controller, wrong pinned target key, invalid invitation, or invalid local credential moves only that endpoint to Attention.
 - Relay and local bridge queues are bounded. Overload closes the affected connection instead of dropping or reordering endpoint bytes.
-- Cloudflare's hibernating WebSocket API does not expose buffered bytes or asynchronous send completion. The Durable Object keeps no userland payload queue and disconnects the failed recipient if `send()` throws; Herdr's bounded device-side queues provide the observable backpressure boundary.
+- The ordered WebRTC data channel provides asynchronous endpoint delivery and backpressure. The signaling Durable Object never queues or forwards terminal output; Herdr's bounded device-side queues remain the observable backpressure boundary.
 
 Relay profile metadata and credentials are stored in separate private versioned files. The profile includes the relay URL, opaque route, pinned target public key, session, and credential reference. Static private keys and invitation secrets never enter the machine catalog. The Cloudflare registration capability exists only in the target's private relay state.
 

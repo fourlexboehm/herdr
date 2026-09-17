@@ -1,5 +1,8 @@
 import { errorResponse, jsonResponse } from "./http";
-import { parseRelayUpgrade } from "./routing";
+import {
+  parseRelayUpgrade,
+  parseTurnCredentialsRequest,
+} from "./routing";
 
 export { TargetRelay } from "./relay";
 
@@ -27,6 +30,18 @@ const worker = {
         status: "ok",
         relay_protocol: 1,
       });
+    }
+
+    const turn = parseTurnCredentialsRequest(request);
+    if (turn instanceof Response) {
+      return turn;
+    }
+    if (turn !== null) {
+      const stub = env.TARGET_RELAY.getByName(turn.route);
+      return stub.issueTurnCredentials(
+        turn.route,
+        request.headers.get("Authorization"),
+      );
     }
 
     const upgrade = parseRelayUpgrade(request);

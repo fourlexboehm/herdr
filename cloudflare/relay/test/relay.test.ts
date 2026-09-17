@@ -24,6 +24,7 @@ import {
 } from "../src/protocol";
 import { reconstructSocketState } from "../src/relay";
 import type { TargetRelay } from "../src/relay";
+import { normalizeTurnAllocation } from "../src/turn";
 
 interface RouteCredentials {
   route: string;
@@ -183,6 +184,113 @@ describe("Cloudflare relay", () => {
       400,
       "query_not_allowed",
     );
+    await expectError(
+      await exports.default.fetch(
+        `https://relay.test/v1/turn-credentials/${randomBase64Url32()}`,
+      ),
+      405,
+      "method_not_allowed",
+    );
+    await expectError(
+      await exports.default.fetch(
+        new Request(
+          `https://relay.test/v1/turn-credentials/${randomBase64Url32()}`,
+          { method: "POST" },
+        ),
+      ),
+      401,
+      "target_capability_required",
+    );
+  });
+
+  it("authenticates TURN credentials and reports optional configuration", async () => {
+    const unregistered = createRouteCredentials();
+    await expectError(
+      await exports.default.fetch(
+        new Request(
+          `https://relay.test/v1/turn-credentials/${unregistered.route}`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${unregistered.capability}`,
+            },
+          },
+        ),
+      ),
+      403,
+      "target_auth_failed",
+    );
+
+    const credentials = createRouteCredentials();
+    const target = await connectTarget(credentials);
+    await target.inbox.nextEnvelope();
+
+    await expectError(
+      await exports.default.fetch(
+        new Request(
+          `https://relay.test/v1/turn-credentials/${credentials.route}`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${randomBase64Url32()}`,
+            },
+          },
+        ),
+      ),
+      403,
+      "target_auth_failed",
+    );
+    await expectError(
+      await exports.default.fetch(
+        new Request(
+          `https://relay.test/v1/turn-credentials/${credentials.route}`,
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${credentials.capability}`,
+            },
+          },
+        ),
+      ),
+      501,
+      "turn_not_configured",
+    );
+    target.inbox.close();
+  });
+
+  it("normalizes TURN allocations and removes the timeout-prone port", () => {
+    expect(
+      normalizeTurnAllocation({
+        iceServers: [
+          { urls: ["stun:stun.cloudflare.com:3478"] },
+          {
+            urls: [
+              "turn:turn.cloudflare.com:53?transport=udp",
+              "turn:turn.cloudflare.com:3478?transport=udp",
+              "turns:turn.cloudflare.com:443?transport=tcp",
+            ],
+            username: "temporary-user",
+            credential: "temporary-password",
+          },
+        ],
+      }),
+    ).toEqual({
+      iceServers: [
+        {
+          urls: ["stun:stun.cloudflare.com:3478"],
+          username: "",
+          credential: "",
+        },
+        {
+          urls: [
+            "turn:turn.cloudflare.com:3478?transport=udp",
+            "turns:turn.cloudflare.com:443?transport=tcp",
+          ],
+          username: "temporary-user",
+          credential: "temporary-password",
+        },
+      ],
+    });
   });
 
   it("persists only a salted target verifier and authenticates reconnects", async () => {

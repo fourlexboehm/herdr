@@ -9,7 +9,7 @@ description: Local と保存済み SSH マシンを 1 つの Herdr ウィンド�
 
 ## ファイアウォール越しの暗号化 Relay
 
-実験的な Relay マシンでは、ターゲットとコントローラーの両方が Cloudflare Worker へ外向き WSS 接続を作ります。ターゲット側に受信ポートや Cloudflare Tunnel は不要です。Durable Object はライブソケットを中継しますが、既存の Herdr endpoint generation 1 ストリームは Noise でエンドツーエンド暗号化されます。
+実験的な Relay マシンでは、ターゲットとコントローラーの両方が Cloudflare Worker へ外向き WSS 接続を作り、ランデブー、Noise 認証、ICE シグナリング、接続ライフサイクルだけに使います。Herdr は順序保証された WebRTC データチャネルを非同期にネゴシエートします。ICE は STUN で見つけた直接 UDP 経路を優先し、NAT やファイアウォールで直接通信できない場合は TURN を使います。endpoint バイトは WSS を通らず、選択された WebRTC 経路上で Noise によりエンドツーエンド暗号化されます。ターゲット側に受信ポートや Cloudflare Tunnel は不要です。
 
 この機能は Linux/macOS 向けで、独立したセキュリティ監査をまだ受けていません。高リスクのリモートアクセスには使用しないでください。Cloudflare は内容を復号できませんが、IP アドレス、接続時刻、通信量を観測できます。
 
@@ -21,6 +21,15 @@ npm ci
 npm run check
 npx wrangler deploy
 ```
+
+WSS シグナリングと直接 ICE/STUN は追加サービスなしで動作します。直接通信できない場合も確実に接続するには、Cloudflare Realtime TURN キーを作成し、ID と API トークンを Worker secrets に追加します:
+
+```bash
+npx wrangler secret put TURN_KEY_ID
+npx wrangler secret put TURN_KEY_API_TOKEN
+```
+
+TURN には Realtime の無料枠と従量料金があります。有効にする前に最新の料金を確認してください。Worker は長期トークンを、2 台のピア用の個別の短期認証情報を生成するためだけに使います。Herdr は直接 UDP を先に試すため、ICE が Relay を必要とする場合だけ TURN が endpoint 通信を運びます。TURN が未設定でも直接 ICE は利用できますが、WebRTC 経路が開かなければ endpoint バイトを WSS へ送らず、接続を失敗させて再試行します。
 
 両方のデバイスのターミナルで、同じ Relay URL を指定して実行します:
 
@@ -42,7 +51,7 @@ herdr relay revoke <controller-public-key>
 herdr relay status
 ```
 
-Cloudflare Free plan では SQLite-backed Durable Objects を利用できますが、継続的なターミナル出力は 1 日の無料リクエスト枠を使い切る可能性があります。Relay は Herdr データ、Noise 鍵、招待、端末履歴を保存せず、salt 付き登録 verifier と制限付きの不正利用カウンターだけを保存します。
+Cloudflare Free plan では SQLite-backed Durable Objects を利用できます。ターミナル出力は Durable Object を通りませんが、TURN 通信には Realtime の別料金が適用されます。Relay は Herdr データ、Noise 鍵、招待、TURN 認証情報、ICE 記述、端末履歴を保存せず、salt 付き登録 verifier と制限付きの不正利用カウンターだけを保存します。ICE 設定と記述は Noise 暗号文の中を通ります。
 
 ## 接続前の確認
 

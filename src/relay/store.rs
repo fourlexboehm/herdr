@@ -23,6 +23,12 @@ const MAX_PAIRED_DEVICES: usize = 64;
 const DEFAULT_INVITATION_TTL_SECONDS: u64 = 15 * 60;
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(1);
 
+/// An invitation consumed by a different public key means the code reached
+/// someone else first. Callers report that separately from an ordinary retry so
+/// setup can warn instead of advising a fresh exchange.
+pub(crate) const INVITATION_ALREADY_USED: &str =
+    "relay invitation has already been used by another device";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RelayInvitation {
@@ -494,12 +500,14 @@ impl RelayHostState {
             .map(Zeroizing::new)
     }
 
+    /// Returns whether this confirmation added a new paired device. A repaired
+    /// controller whose earlier confirmation was lost returns `false`.
     pub(crate) fn complete_pairing(
         &mut self,
         invitation_id: &str,
         public_key: &[u8],
         label: &str,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         validate_label(label)?;
         let invitation_index = self
             .invitations
@@ -512,15 +520,22 @@ impl RelayHostState {
         let invitation = self.invitations[invitation_index].clone();
         let public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public_key);
         if let Some(consumed_by) = &invitation.consumed_by {
-            if consumed_by == &public_key
-                && self
-                    .paired_devices
-                    .iter()
-                    .any(|device| device.public_key == public_key)
-            {
-                return Ok(());
+            if consumed_by != &public_key {
+                return Err(INVITATION_ALREADY_USED.into());
             }
-            return Err("relay invitation has already been used by another device".into());
+            if self
+                .paired_devices
+                .iter()
+                .any(|device| device.public_key == public_key)
+            {
+                return Ok(false);
+            }
+            // The same device consumed this invitation and was revoked since.
+            // Revocation stays sticky; only a new invitation can re-pair it.
+            return Err(
+                "relay invitation was already used by this device, which has since been revoked"
+                    .into(),
+            );
         }
         if self
             .paired_devices
@@ -529,7 +544,7 @@ impl RelayHostState {
         {
             // A fresh invitation can repair a controller whose confirmation was lost.
             self.invitations[invitation_index].consumed_by = Some(public_key);
-            return Ok(());
+            return Ok(false);
         }
         if self.paired_devices.len() >= MAX_PAIRED_DEVICES {
             return Err(format!(
@@ -543,7 +558,7 @@ impl RelayHostState {
             paired_unix_seconds: now_unix_seconds(),
         });
         self.invitations[invitation_index].consumed_by = Some(public_key);
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) fn paired_device(&self, public_key: &[u8]) -> Option<&PairedDevice> {
@@ -842,17 +857,27 @@ mod tests {
         let mut state = RelayHostState::create("wss://relay.example", "studio", "default").unwrap();
         let invitation = state.create_invitation().unwrap();
         let device = IdentityKeypair::generate().unwrap();
-        state
+        assert!(state
             .complete_pairing(&invitation.invitation_id, device.public(), "laptop")
-            .unwrap();
+            .unwrap());
         assert!(state.invitation_secret(&invitation.invitation_id).is_some());
         let other = IdentityKeypair::generate().unwrap();
-        assert!(state
-            .complete_pairing(&invitation.invitation_id, other.public(), "other")
-            .is_err());
+        assert_eq!(
+            state
+                .complete_pairing(&invitation.invitation_id, other.public(), "other")
+                .unwrap_err(),
+            INVITATION_ALREADY_USED
+        );
         let public = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(device.public());
         assert!(state.revoke(&public));
         assert!(state.paired_devices.is_empty());
+        // A revoked device retrying its own consumed code is not a stolen code.
+        assert_ne!(
+            state
+                .complete_pairing(&invitation.invitation_id, device.public(), "laptop")
+                .unwrap_err(),
+            INVITATION_ALREADY_USED
+        );
     }
 
     #[test]

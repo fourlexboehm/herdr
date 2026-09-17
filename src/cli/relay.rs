@@ -11,7 +11,8 @@ const HELP: &str = "Usage:
   herdr relay revoke <public-key>
   herdr relay status [--json]
 
-Relay hosting is experimental. The target makes only outbound WSS connections.
+Relay hosting is experimental. Both peers use outbound WSS only for setup and signaling;
+endpoint traffic requires direct ICE/STUN or configured TURN.
 Invitations are one-use secrets; transfer them through a trusted channel.";
 
 pub(super) fn run_relay_command(args: &[String]) -> std::io::Result<i32> {

@@ -47,7 +47,7 @@ impl Drop for StateDirectory {
 }
 
 #[test]
-fn relay_confirmation_rechecks_revocation_and_expiry_before_local_access() {
+fn relay_websocket_confirmation_is_rejected_before_local_access() {
     let _lock = crate::config::test_config_env_lock().lock().unwrap();
     let _directory = StateDirectory::new("confirmation");
     tokio::runtime::Builder::new_current_thread()
@@ -63,7 +63,6 @@ fn relay_confirmation_rechecks_revocation_and_expiry_before_local_access() {
                 .unwrap();
             let identity = host.identity().unwrap();
             let prologue = handshake_prologue(&host.route_id, identity.public(), &host.session);
-            let (tx, _rx) = tokio::sync::mpsc::channel(64);
             for expired in [false, true] {
                 let (initiator, first) =
                     start_reconnect_initiator(&controller, identity.public(), &prologue, b"")
@@ -73,7 +72,7 @@ fn relay_confirmation_rechecks_revocation_and_expiry_before_local_access() {
                 let mut sender = initiator.finish(&response).unwrap();
                 let mut connections = HashMap::from([(
                     1,
-                    TargetConnection::AwaitingConfirmation {
+                    TargetConnection::AwaitingConfirmation(PendingAuthorization {
                         deadline: if expired {
                             Instant::now() - Duration::from_secs(1)
                         } else {
@@ -82,7 +81,7 @@ fn relay_confirmation_rechecks_revocation_and_expiry_before_local_access() {
                         secure,
                         pairing: None,
                         device_public_key: controller.public().to_vec(),
-                    },
+                    }),
                 )]);
                 host.revoke(
                     &base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(controller.public()),
@@ -95,8 +94,8 @@ fn relay_confirmation_rechecks_revocation_and_expiry_before_local_access() {
                     &identity,
                     &prologue,
                     &mut connections,
-                    &tx,
-                    &PathBuf::from("/nonexistent-audit-socket"),
+                    None,
+                    None,
                     &mut Captured::default(),
                     RelayEnvelope {
                         kind: RelayEnvelopeKind::Data,
@@ -114,9 +113,95 @@ fn relay_confirmation_rechecks_revocation_and_expiry_before_local_access() {
                         io::ErrorKind::PermissionDenied
                     }
                 );
+                if !expired {
+                    assert_eq!(
+                        error.to_string(),
+                        "relay controller did not negotiate peer transport"
+                    );
+                }
                 assert!(connections.is_empty());
             }
         });
+}
+
+#[test]
+fn relay_peer_confirmation_rechecks_revocation_before_local_access() {
+    let _lock = crate::config::test_config_env_lock().lock().unwrap();
+    let _directory = StateDirectory::new("peer-confirmation");
+    let mut host = RelayHostState::create("wss://relay.example", "audit", "default").unwrap();
+    let invite = host.create_invitation().unwrap();
+    let controller = IdentityKeypair::generate().unwrap();
+    host.complete_pairing(&invite.invitation_id, controller.public(), "controller")
+        .unwrap();
+    let identity = host.identity().unwrap();
+    let prologue = handshake_prologue(&host.route_id, identity.public(), &host.session);
+    let (_, first) =
+        start_reconnect_initiator(&controller, identity.public(), &prologue, b"").unwrap();
+    let (responder, _) = receive_reconnect(&identity, &prologue, &first).unwrap();
+    let (secure, _) = responder.finish().unwrap();
+    host.revoke(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(controller.public()));
+    host.store_to_path(&super::super::store::host_state_path())
+        .unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let result = authorize_target_connection(
+        &host,
+        PendingAuthorization {
+            deadline: Instant::now() + HANDSHAKE_TIMEOUT,
+            secure,
+            pairing: None,
+            device_public_key: controller.public().to_vec(),
+        },
+        1,
+        &tx,
+        &PathBuf::from("/nonexistent-audit-socket"),
+    );
+    match result {
+        Err(error) => assert_eq!(error.kind(), io::ErrorKind::PermissionDenied),
+        Ok(_) => panic!("revoked controller reached the local endpoint"),
+    }
+}
+
+#[tokio::test]
+async fn failed_peer_setup_does_not_restore_websocket_transport() {
+    let target = IdentityKeypair::generate().unwrap();
+    let controller = IdentityKeypair::generate().unwrap();
+    let prologue = b"mandatory-peer-transport";
+    let (_, first) =
+        start_reconnect_initiator(&controller, target.public(), prologue, b"").unwrap();
+    let (responder, _) = receive_reconnect(&target, prologue, &first).unwrap();
+    let (secure, _) = responder.finish().unwrap();
+    let mut connections = HashMap::from([(
+        1,
+        TargetConnection::AwaitingP2pAnswer(PendingAuthorization {
+            deadline: Instant::now() + P2P_HANDSHAKE_TIMEOUT,
+            secure,
+            pairing: None,
+            device_public_key: controller.public().to_vec(),
+        }),
+    )]);
+    let mut early_events = HashMap::new();
+    let (setup_tx, _setup_rx) = tokio::sync::mpsc::channel(1);
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1);
+    let mut sink = Captured::default();
+    let error = handle_host_p2p_setup(
+        HostP2pSetupEvent::Answer {
+            connection_id: 1,
+            result: Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "peer setup timed out",
+            )),
+        },
+        &mut connections,
+        &mut early_events,
+        &setup_tx,
+        &event_tx,
+        &mut sink,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    assert!(connections.is_empty());
+    assert!(sink.0.is_empty());
 }
 
 #[tokio::test]
@@ -124,7 +209,6 @@ async fn relay_host_limits_untrusted_opens_and_rejects_duplicate_ids() {
     let host = RelayHostState::create("wss://relay.example", "audit", "default").unwrap();
     let identity = host.identity().unwrap();
     let prologue = handshake_prologue(&host.route_id, identity.public(), &host.session);
-    let (tx, _rx) = tokio::sync::mpsc::channel(64);
     let mut connections = HashMap::new();
     let mut sink = Captured::default();
     for connection_id in 1..=MAX_HOST_CONNECTIONS as u32 {
@@ -133,8 +217,8 @@ async fn relay_host_limits_untrusted_opens_and_rejects_duplicate_ids() {
             &identity,
             &prologue,
             &mut connections,
-            &tx,
-            &PathBuf::new(),
+            None,
+            None,
             &mut sink,
             RelayEnvelope {
                 kind: RelayEnvelopeKind::Open,
@@ -151,8 +235,8 @@ async fn relay_host_limits_untrusted_opens_and_rejects_duplicate_ids() {
             &identity,
             &prologue,
             &mut connections,
-            &tx,
-            &PathBuf::new(),
+            None,
+            None,
             &mut sink,
             RelayEnvelope {
                 kind: RelayEnvelopeKind::Open,

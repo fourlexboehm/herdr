@@ -147,6 +147,15 @@ pub(super) fn run(args: &[String]) -> io::Result<i32> {
             }
             Ok(0)
         }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            writeln!(output, "Could not connect to {}: {error}", profile.label)?;
+            writeln!(
+                output,
+                "Another device completed pairing with that code first. Run `herdr relay devices` on {} and revoke any device you do not recognize before exchanging a new code.",
+                profile.label
+            )?;
+            Ok(1)
+        }
         Err(error) => {
             writeln!(output, "Could not connect to {}: {error}", profile.label)?;
             writeln!(output, "The machine is saved for retry. Run this command again and exchange fresh codes on both devices.")?;

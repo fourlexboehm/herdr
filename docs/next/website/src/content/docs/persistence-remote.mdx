@@ -37,7 +37,7 @@ herdr session delete side-project --json
 
 ## Saved machines
 
-To keep Local and several remote machines in one Herdr window, see [Connecting machines](/docs/connecting-machines/). Saved SSH uses OpenSSH. Experimental encrypted Relay machines use outbound WSS on both sides, a blind Cloudflare Durable Object rendezvous, and Noise around the stable endpoint stream. The guide covers deployment, pairing, switching, reconnects, security limits, and revocation. Removing a saved machine only disconnects the client; it does not stop that machine's sessions.
+To keep Local and several remote machines in one Herdr window, see [Connecting machines](/docs/connecting-machines/). Saved SSH uses OpenSSH. Experimental encrypted Relay machines use outbound WSS on both sides only for rendezvous and signaling, require direct ICE/STUN UDP or TURN for endpoint traffic, and keep Noise around the stable endpoint stream. The guide covers deployment, pairing, switching, reconnects, security limits, and revocation. Removing a saved machine only disconnects the client; it does not stop that machine's sessions.
 
 ## Remote attach over SSH
 

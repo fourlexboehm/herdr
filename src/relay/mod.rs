@@ -5,6 +5,7 @@
 //! inside the encrypted byte stream.
 
 pub(crate) mod crypto;
+pub(crate) mod p2p;
 pub(crate) mod protocol;
 pub(crate) mod store;
 pub(crate) mod transport;

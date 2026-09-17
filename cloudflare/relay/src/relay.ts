@@ -17,6 +17,7 @@ import {
   MAX_PAYLOAD_BYTES,
   MAX_TARGET_CONNECTION_ATTEMPTS_PER_MINUTE,
   MAX_TARGET_FRAME_BYTES,
+  MAX_TURN_CREDENTIAL_REQUESTS_PER_MINUTE,
   MIN_CONNECTION_ID,
   RELAY_PROTOCOL_VERSION,
   SYSTEM_CONNECTION_ID,
@@ -34,6 +35,7 @@ import {
   type TargetEnvelope,
 } from "./protocol";
 import { parseRelayUpgrade, type RelayRole } from "./routing";
+import { generateTurnAllocation } from "./turn";
 
 interface SocketAttachment {
   version: typeof RELAY_PROTOCOL_VERSION;
@@ -89,6 +91,12 @@ export class TargetRelay extends DurableObject<Env> {
           count INTEGER NOT NULL CHECK (count > 0)
         )
       `);
+      this.ctx.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS relay_turn_credential_requests (
+          window_start INTEGER PRIMARY KEY,
+          count INTEGER NOT NULL CHECK (count > 0)
+        )
+      `);
       return Promise.resolve();
     });
   }
@@ -103,6 +111,91 @@ export class TargetRelay extends DurableObject<Env> {
       return this.connectTarget(request, upgrade.route);
     }
     return this.connectController();
+  }
+
+  async issueTurnCredentials(
+    route: string,
+    authorization: string | null,
+  ): Promise<Response> {
+    const capability = parseTargetCapability(authorization);
+    if (capability === null) {
+      return errorResponse(
+        401,
+        "target_capability_required",
+        "The TURN credential endpoint requires a valid target capability.",
+        { "WWW-Authenticate": "Bearer" },
+      );
+    }
+    const authorizationResult = await this.authorizeExistingTarget(
+      route,
+      capability,
+    );
+    if (authorizationResult === "invalid_metadata") {
+      console.error({ event: "relay_target_verifier_invalid" });
+      return errorResponse(
+        500,
+        "target_verifier_invalid",
+        "The target registration verifier is invalid.",
+      );
+    }
+    if (authorizationResult === "denied") {
+      return errorResponse(
+        403,
+        "target_auth_failed",
+        "The target registration capability does not match this route.",
+      );
+    }
+    if (!this.recordTurnCredentialRequest()) {
+      return errorResponse(
+        429,
+        "turn_credential_rate_limited",
+        "This target route requested too many TURN credentials.",
+        { "Retry-After": "60" },
+      );
+    }
+
+    const keyId = Reflect.get(this.env, "TURN_KEY_ID") as unknown;
+    const apiToken = Reflect.get(
+      this.env,
+      "TURN_KEY_API_TOKEN",
+    ) as unknown;
+    if (
+      typeof keyId !== "string" ||
+      keyId === "" ||
+      typeof apiToken !== "string" ||
+      apiToken === ""
+    ) {
+      return errorResponse(
+        501,
+        "turn_not_configured",
+        "This relay does not have Cloudflare TURN configured.",
+      );
+    }
+    try {
+      const allocations = await Promise.all([
+        generateTurnAllocation(keyId, apiToken),
+        generateTurnAllocation(keyId, apiToken),
+      ]);
+      return Response.json(
+        { allocations },
+        {
+          headers: {
+            "Cache-Control": "no-store",
+          },
+        },
+      );
+    } catch (error) {
+      console.error({
+        event: "turn_credential_broker_failed",
+        error_type:
+          error instanceof Error ? error.name : typeof error,
+      });
+      return errorResponse(
+        502,
+        "turn_credential_generation_failed",
+        "The relay could not generate temporary TURN credentials.",
+      );
+    }
   }
 
   override webSocketMessage(
@@ -622,6 +715,25 @@ export class TargetRelay extends DurableObject<Env> {
     return verified ? "authorized" : "denied";
   }
 
+  private async authorizeExistingTarget(
+    route: string,
+    capability: string,
+  ): Promise<AuthorizationResult> {
+    const registration = this.readTargetRegistration();
+    if (registration === null) {
+      return "denied";
+    }
+    const verified = await verifyRegistrationCapability(
+      route,
+      capability,
+      registration,
+    );
+    if (verified === null) {
+      return "invalid_metadata";
+    }
+    return verified ? "authorized" : "denied";
+  }
+
   private readTargetRegistration(): RegistrationVerifier | null {
     const rows = this.ctx.storage.sql
       .exec<TargetRegistrationRow>(
@@ -669,6 +781,26 @@ export class TargetRelay extends DurableObject<Env> {
       )
       .one();
     return row.count <= MAX_TARGET_CONNECTION_ATTEMPTS_PER_MINUTE;
+  }
+
+  private recordTurnCredentialRequest(): boolean {
+    const windowStart = Math.floor(Date.now() / 60_000);
+    this.ctx.storage.sql.exec(
+      "DELETE FROM relay_turn_credential_requests WHERE window_start < ?",
+      windowStart - 1,
+    );
+    const row = this.ctx.storage.sql
+      .exec<{ count: number }>(
+        `
+          INSERT INTO relay_turn_credential_requests (window_start, count)
+          VALUES (?, 1)
+          ON CONFLICT(window_start) DO UPDATE SET count = count + 1
+          RETURNING count
+        `,
+        windowStart,
+      )
+      .one();
+    return row.count <= MAX_TURN_CREDENTIAL_REQUESTS_PER_MINUTE;
   }
 }
 

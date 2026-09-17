@@ -51,6 +51,8 @@ snow = { version = "0.10.0", default-features = false, features = ["default-reso
 getrandom = "0.3.3"
 zeroize = "1.8.1"
 futures-util = "0.3.31"
+reqwest = { version = "0.12.23", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+webrtc = "0.14.0"
 
 [patch.crates-io]
 portable-pty = { path = "vendor/portable-pty" }

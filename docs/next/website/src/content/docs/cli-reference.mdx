@@ -95,7 +95,7 @@ herdr relay revoke <controller-public-key>
 herdr relay status [--json]
 ```
 
-`relay enable` creates a private static device identity, random route, and independent relay-registration capability when the target has no relay state. It starts the configured server if needed and waits for relay hosting to become ready. Updated running servers apply enable, disable, and re-enable changes without restarting. `relay invite` writes a one-use 15-minute invitation to stdout and a warning to stderr. `relay devices` exposes controller labels, roles, public keys, and pairing times; `relay revoke` removes one key and active relay hosting disconnects it on the next authorization refresh.
+`relay enable` creates a private static device identity, random route, and independent relay-registration capability when the target has no relay state. It starts the configured server if needed and waits for relay hosting to become ready. Peers use WSS only for setup and signaling; endpoint traffic requires direct ICE/STUN UDP or configured TURN. Updated running servers apply enable, disable, and re-enable changes without restarting. `relay invite` writes a one-use 15-minute invitation to stdout and a warning to stderr. `relay devices` exposes controller labels, roles, public keys, and pairing times; `relay revoke` removes one key and active relay hosting disconnects it on the next authorization refresh.
 
 The feature is experimental and Linux/macOS-first. See [Encrypted relay through firewalls](/docs/connecting-machines/#encrypted-relay-through-firewalls) for deployment, pairing, security limits, and Cloudflare Free-plan behavior.
 
