@@ -26,6 +26,11 @@ pub(crate) use super::unix_common::{
 mod bootstrap;
 pub(crate) use bootstrap::{configure_server_daemon_context, prepare_server_process};
 
+mod keychain;
+// Unreferenced in test builds; see the note in keychain.rs.
+#[cfg_attr(test, allow(unused_imports))]
+pub(crate) use keychain::relay_state_key;
+
 #[cfg(test)]
 mod config_file_tests;
 

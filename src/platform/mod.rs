@@ -158,6 +158,13 @@ pub(crate) fn prepare_server_process(_handoff_import: bool) -> std::io::Result<b
     Ok(false)
 }
 
+/// Master key protecting relay state at rest, or `None` when the platform has
+/// no system keystore and the state stays plaintext JSON.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn relay_state_key() -> std::io::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
+    Ok(None)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn detach_server_daemon_command(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;

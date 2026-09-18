@@ -3,6 +3,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -14,6 +15,7 @@ use super::protocol::{
     valid_capability, RelayRole, CAPABILITY_BYTES, INVITATION_SECRET_BYTES, RELAY_PROTOCOL_VERSION,
     ROUTE_BYTES,
 };
+use super::sealed::{self, SEAL_OVERHEAD};
 
 const STORE_VERSION: u8 = 1;
 const INVITATION_PREFIX: &str = "herdr-relay-v1:";
@@ -212,14 +214,9 @@ impl RelayClientStore {
     }
 
     fn load_from_path(path: &Path) -> Result<Self, String> {
-        let content = match std::fs::read(path) {
-            Ok(content) => content,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(error) => return Err(format!("failed to read relay client credentials: {error}")),
+        let Some(content) = read_store_bytes(path, "relay client credentials")? else {
+            return Ok(Self::default());
         };
-        if content.len() as u64 > MAX_STATE_BYTES {
-            return Err("relay client credentials exceed the storage limit".into());
-        }
         let store: Self = serde_json::from_slice(&content)
             .map_err(|error| format!("stored relay client credentials are invalid: {error}"))?;
         store.validate()?;
@@ -398,14 +395,9 @@ impl RelayHostState {
     }
 
     pub(crate) fn load_from_path(path: &Path) -> Result<Option<Self>, String> {
-        let content = match std::fs::read(path) {
-            Ok(content) => content,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("failed to read relay host state: {error}")),
+        let Some(content) = read_store_bytes(path, "relay host state")? else {
+            return Ok(None);
         };
-        if content.len() as u64 > MAX_STATE_BYTES {
-            return Err("relay host state exceeds the storage limit".into());
-        }
         let mut state: Self = serde_json::from_slice(&content)
             .map_err(|error| format!("stored relay host state is invalid: {error}"))?;
         state.validate()?;
@@ -673,10 +665,63 @@ fn with_store_lock<T>(
     operation()
 }
 
+/// Resolved once per process: `update()` reads and writes in one lock, and a
+/// keychain fetch can prompt, so it must not happen twice per operation.
+static AT_REST_KEY: OnceLock<Option<Zeroizing<Vec<u8>>>> = OnceLock::new();
+
+/// Master key protecting relay state at rest, or `None` where the platform has
+/// no system keystore and state stays plaintext JSON.
+fn at_rest_key() -> Result<Option<&'static Zeroizing<Vec<u8>>>, String> {
+    if let Some(cached) = AT_REST_KEY.get() {
+        return Ok(cached.as_ref());
+    }
+    // Unit tests must exercise the sealed path without touching the real
+    // login keychain, which would prompt and persist an item on developer Macs.
+    #[cfg(test)]
+    let key = Some(Zeroizing::new(vec![0x5a_u8; 32]));
+    #[cfg(not(test))]
+    let key = crate::platform::relay_state_key()
+        .map_err(|error| format!("failed to open the relay key in the keychain: {error}"))?;
+    Ok(AT_REST_KEY.get_or_init(|| key).as_ref())
+}
+
+/// Reads a relay state file, unsealing it when it is sealed.
+///
+/// Plaintext files are still accepted so an install that predates at-rest
+/// protection keeps working; the next write reseals them.
+fn read_store_bytes(path: &Path, description: &str) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("failed to read {description}: {error}")),
+    };
+    if raw.len() as u64 > MAX_STATE_BYTES.saturating_add(SEAL_OVERHEAD as u64) {
+        return Err(format!("{description} exceeds the storage limit"));
+    }
+    let content = if sealed::is_sealed(&raw) {
+        let key = at_rest_key()?.ok_or_else(|| {
+            format!("{description} is encrypted but this platform has no keychain to unlock it")
+        })?;
+        sealed::open(key, &raw)?
+    } else {
+        Zeroizing::new(raw)
+    };
+    if content.len() as u64 > MAX_STATE_BYTES {
+        return Err(format!("{description} exceeds the storage limit"));
+    }
+    Ok(Some(content))
+}
+
 fn store_private_json(path: &Path, content: &[u8], description: &str) -> Result<(), String> {
     if content.len() as u64 > MAX_STATE_BYTES {
         return Err(format!("{description} exceeds the storage limit"));
     }
+    // A plaintext file from an older install is resealed by this write.
+    let sealed = match at_rest_key()? {
+        Some(key) => Some(sealed::seal(key, content)?),
+        None => None,
+    };
+    let content = sealed.as_deref().unwrap_or(content);
     let parent = path
         .parent()
         .ok_or_else(|| format!("invalid {description} path: {}", path.display()))?;
@@ -919,14 +964,83 @@ mod tests {
         let mut clients = RelayClientStore::default();
         let id = clients.import_invitation(&invitation).unwrap();
         clients.store_to_path(&path).unwrap();
-        assert!(std::fs::read_to_string(&path)
-            .unwrap()
-            .contains(&invitation.enrollment_secret));
+        let reloaded = RelayClientStore::load_from_path(&path).unwrap();
+        assert_eq!(
+            reloaded
+                .credential(&id)
+                .and_then(|credential| credential.pairing.as_ref())
+                .map(|pairing| pairing.enrollment_secret.as_str()),
+            Some(invitation.enrollment_secret.as_str())
+        );
         clients.complete_pairing(&id).unwrap();
         clients.store_to_path(&path).unwrap();
-        assert!(!std::fs::read_to_string(&path)
+        assert!(RelayClientStore::load_from_path(&path)
             .unwrap()
-            .contains(&invitation.enrollment_secret));
+            .credential(&id)
+            .is_some_and(|credential| credential.pairing.is_none()));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn stored_state_is_sealed_and_leaks_no_secret_bytes() {
+        let path = path("sealed");
+        let mut state = RelayHostState::create("wss://relay.example", "studio", "default").unwrap();
+        let invitation = state.create_invitation().unwrap();
+        state.store_to_path(&path).unwrap();
+
+        let raw = std::fs::read(&path).unwrap();
+        assert!(sealed::is_sealed(&raw));
+        // Every secret the host state carries must be absent from the file.
+        for secret in [
+            &state.private_key,
+            &state.registration_capability,
+            &invitation.enrollment_secret,
+        ] {
+            assert!(
+                !raw.windows(secret.len())
+                    .any(|window| window == secret.as_bytes()),
+                "a secret survived in the sealed file"
+            );
+        }
+        assert_eq!(RelayHostState::load_from_path(&path).unwrap(), Some(state));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn plaintext_state_from_an_older_install_still_loads_and_is_resealed() {
+        let path = path("migrate");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let state = RelayHostState::create("wss://relay.example", "studio", "default").unwrap();
+
+        // Exactly what a pre-encryption install left on disk.
+        std::fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+        assert!(!sealed::is_sealed(&std::fs::read(&path).unwrap()));
+        assert_eq!(
+            RelayHostState::load_from_path(&path).unwrap(),
+            Some(state.clone())
+        );
+
+        RelayHostState::update_from_path(&path, |current| Ok((current, ()))).unwrap();
+        assert!(sealed::is_sealed(&std::fs::read(&path).unwrap()));
+        assert_eq!(RelayHostState::load_from_path(&path).unwrap(), Some(state));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn corrupted_sealed_state_is_an_error_rather_than_a_silent_reset() {
+        let path = path("corrupt");
+        RelayHostState::create("wss://relay.example", "studio", "default")
+            .unwrap()
+            .store_to_path(&path)
+            .unwrap();
+        let mut raw = std::fs::read(&path).unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 0x01;
+        std::fs::write(&path, &raw).unwrap();
+        // A load that silently returned None here would re-enroll the host and
+        // orphan every paired controller.
+        assert!(RelayHostState::load_from_path(&path).is_err());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
