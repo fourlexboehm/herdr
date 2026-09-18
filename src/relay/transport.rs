@@ -26,7 +26,7 @@ use super::p2p::{answer as answer_p2p, P2pAnswer, P2pConfig, P2pEvent, P2pOffer,
 use super::protocol::{
     decode_handshake_message, decode_secure_frame, encode_handshake_message, encode_secure_frame,
     handshake_prologue, HandshakeMode, HandshakePayload, RelayEnvelope, RelayEnvelopeKind,
-    SecureFrameKind, MAX_RELAY_ENVELOPE, MAX_RELAY_PAYLOAD, RELAY_PROTOCOL_VERSION,
+    SecureFrameKind, ENCRYPTED_HANDSHAKE_VERSION, MAX_RELAY_ENVELOPE, MAX_RELAY_PAYLOAD,
 };
 use super::store::{RelayClientStore, RelayHostState};
 
@@ -207,7 +207,7 @@ async fn open_controller_session(
         HandshakeMode::Reconnect
     };
     let payload = HandshakePayload {
-        version: RELAY_PROTOCOL_VERSION,
+        version: ENCRYPTED_HANDSHAKE_VERSION,
         invitation_id: pairing.map(|pairing| pairing.invitation_id.clone()),
         controller_label: local_device_label(),
         role: super::protocol::RelayRole::Controller,
@@ -743,6 +743,7 @@ async fn run_host_connection(
                             warn!(
                                 connection_id,
                                 kind = ?error.kind(),
+                                %error,
                                 "closing failed relay controller session"
                             );
                             connections.remove(&connection_id);
@@ -867,6 +868,9 @@ where
         RelayEnvelopeKind::Notice => {
             let notice = std::str::from_utf8(&envelope.payload)
                 .map_err(|_| super::protocol::invalid_data("relay notice is not UTF-8"))?;
+            if notice == "controller_not_found" {
+                connections.remove(&envelope.connection_id);
+            }
             warn!(
                 connection_id = envelope.connection_id,
                 notice, "relay notice"
@@ -984,7 +988,10 @@ where
                         _ => {
                             return Err(io::Error::new(
                                 io::ErrorKind::PermissionDenied,
-                                "relay controller did not negotiate peer transport",
+                                format!(
+                                    "relay controller did not negotiate peer transport: received {kind:?} with {} payload bytes",
+                                    payload.len()
+                                ),
                             ))
                         }
                     }

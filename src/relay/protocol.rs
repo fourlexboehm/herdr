@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 use crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION;
 
 pub(crate) const RELAY_PROTOCOL_VERSION: u8 = 1;
+/// Version of the Noise-protected controller/target protocol. This is separate
+/// from the relay framing version because the Worker does not inspect it, so
+/// the two move independently. Both are 1: nothing has shipped with either.
+pub(crate) const ENCRYPTED_HANDSHAKE_VERSION: u8 = 1;
 pub(crate) const MAX_RELAY_PAYLOAD: usize = 1024 * 1024;
 pub(crate) const MAX_NOISE_PLAINTEXT: usize = 60 * 1024;
 pub(crate) const MAX_NOISE_MESSAGE: usize = u16::MAX as usize;
@@ -327,7 +331,7 @@ pub(crate) struct HandshakePayload {
 
 impl HandshakePayload {
     pub(crate) fn validate(&self, mode: HandshakeMode, expected_session: &str) -> io::Result<()> {
-        if self.version != RELAY_PROTOCOL_VERSION {
+        if self.version != ENCRYPTED_HANDSHAKE_VERSION {
             return Err(invalid_data("unsupported encrypted handshake version"));
         }
         if self.endpoint_generation != ENDPOINT_PROTOCOL_GENERATION {
@@ -414,7 +418,7 @@ mod tests {
     #[test]
     fn handshake_payload_rejects_generation_and_mode_mismatch() {
         let payload = HandshakePayload {
-            version: RELAY_PROTOCOL_VERSION,
+            version: ENCRYPTED_HANDSHAKE_VERSION,
             invitation_id: Some("0123456789abcdef0123456789abcdef".into()),
             controller_label: "laptop".into(),
             role: RelayRole::Controller,

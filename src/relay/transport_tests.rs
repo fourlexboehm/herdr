@@ -116,7 +116,7 @@ fn relay_websocket_confirmation_is_rejected_before_local_access() {
                 if !expired {
                     assert_eq!(
                         error.to_string(),
-                        "relay controller did not negotiate peer transport"
+                        "relay controller did not negotiate peer transport: received ClientConfirm with 0 payload bytes"
                     );
                 }
                 assert!(connections.is_empty());
@@ -255,6 +255,39 @@ async fn relay_host_limits_untrusted_opens_and_rejects_duplicate_ids() {
     }
     assert!(!budget.admit(now));
     assert!(budget.admit(now + Duration::from_secs(60)));
+}
+
+#[tokio::test]
+async fn relay_host_releases_connection_when_controller_disappears() {
+    let host = RelayHostState::create("wss://relay.example", "audit", "default").unwrap();
+    let identity = host.identity().unwrap();
+    let prologue = handshake_prologue(&host.route_id, identity.public(), &host.session);
+    let mut connections = HashMap::from([(
+        7,
+        TargetConnection::AwaitingHandshake {
+            deadline: Instant::now() + HANDSHAKE_TIMEOUT,
+        },
+    )]);
+    let mut sink = Captured::default();
+
+    handle_target_envelope(
+        &host,
+        &identity,
+        &prologue,
+        &mut connections,
+        None,
+        None,
+        &mut sink,
+        RelayEnvelope {
+            kind: RelayEnvelopeKind::Notice,
+            connection_id: 7,
+            payload: b"controller_not_found".to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(connections.is_empty());
 }
 
 #[test]
