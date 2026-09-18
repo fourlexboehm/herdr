@@ -111,9 +111,7 @@ class SocketInbox {
     });
   }
 
-  private async nextMessage(
-    timeoutMs: number,
-  ): Promise<ArrayBuffer | string> {
+  private async nextMessage(timeoutMs: number): Promise<ArrayBuffer | string> {
     const queued = this.messages.shift();
     if (queued !== undefined) {
       return queued;
@@ -178,9 +176,7 @@ describe("Cloudflare relay", () => {
       "invalid_route",
     );
     await expectError(
-      await upgrade(
-        `/v1/controllers/${randomBase64Url32()}?unexpected=true`,
-      ),
+      await upgrade(`/v1/controllers/${randomBase64Url32()}?unexpected=true`),
       400,
       "query_not_allowed",
     );
@@ -379,22 +375,12 @@ describe("Cloudflare relay", () => {
     expect(view.getUint8(1)).toBe(RelayFrameKind.Data);
     expect(view.getUint32(2, false)).toBe(0x1020_3040);
     expect(view.getUint32(6, false)).toBe(3);
-    expect([...frame.slice(TARGET_ENVELOPE_HEADER_BYTES)]).toEqual([
-      9, 8, 7,
-    ]);
+    expect([...frame.slice(TARGET_ENVELOPE_HEADER_BYTES)]).toEqual([9, 8, 7]);
   });
 
   it("wraps controller bytes and unwraps target data without inspection", async () => {
     const pair = await connectPair();
-    const controllerPayload = Uint8Array.from([
-      0,
-      255,
-      1,
-      254,
-      128,
-      13,
-      10,
-    ]);
+    const controllerPayload = Uint8Array.from([0, 255, 1, 254, 128, 13, 10]);
     pair.controller.send(controllerPayload);
 
     const targetData = await pair.target.nextEnvelope();
@@ -407,9 +393,9 @@ describe("Cloudflare relay", () => {
 
     const targetPayload = Uint8Array.from([9, 8, 7, 0, 6, 5]);
     pair.target.send(encodeData(pair.connectionId, targetPayload));
-    expect([
-      ...new Uint8Array(await pair.controller.nextBinary()),
-    ]).toEqual([...targetPayload]);
+    expect([...new Uint8Array(await pair.controller.nextBinary())]).toEqual([
+      ...targetPayload,
+    ]);
 
     pair.target.close();
     pair.controller.close();
@@ -432,36 +418,36 @@ describe("Cloudflare relay", () => {
 
     const targetPayload = Uint8Array.from([1, 2, 3, 4]);
     pair.target.send(encodeData(pair.connectionId, targetPayload));
-    expect([
-      ...new Uint8Array(await pair.controller.nextBinary()),
-    ]).toEqual([...targetPayload]);
+    expect([...new Uint8Array(await pair.controller.nextBinary())]).toEqual([
+      ...targetPayload,
+    ]);
 
     pair.target.close();
     pair.controller.close();
   });
 
-  it("rejects a duplicate live target without disturbing the first", async () => {
+  it("replaces a live target so a half-open socket cannot wedge the route", async () => {
     const credentials = createRouteCredentials();
-    const target = await connectTarget(credentials);
-    await target.inbox.nextEnvelope();
+    const first = await connectTarget(credentials);
+    await first.inbox.nextEnvelope();
 
-    await expectError(
-      await upgrade(`/v1/targets/${credentials.route}`, {
-        Authorization: `Bearer ${credentials.capability}`,
-      }),
-      409,
-      "target_already_connected",
-    );
-
+    // A target that dies without a clean close still reads as open. Refusing
+    // the reconnect would lock the only authorized target out of its own
+    // route, so an authenticated reconnect has to win.
     const controller = await connectController(credentials.route);
-    const open = await target.inbox.nextEnvelope();
-    expect(open.kind).toBe(RelayFrameKind.Open);
-    controller.inbox.send(Uint8Array.from([44]));
-    expect((await target.inbox.nextEnvelope()).kind).toBe(
-      RelayFrameKind.Data,
-    );
+    expect((await first.inbox.nextEnvelope()).kind).toBe(RelayFrameKind.Open);
 
-    target.inbox.close();
+    const second = await connectTarget(credentials);
+    expect((await second.inbox.nextEnvelope()).kind).toBe(
+      RelayFrameKind.Notice,
+    );
+    // The controller survives the handover and is reopened on the new socket.
+    expect((await second.inbox.nextEnvelope()).kind).toBe(RelayFrameKind.Open);
+
+    controller.inbox.send(Uint8Array.from([44]));
+    expect((await second.inbox.nextEnvelope()).kind).toBe(RelayFrameKind.Data);
+
+    second.inbox.close();
     controller.inbox.close();
   });
 
@@ -519,9 +505,7 @@ describe("Cloudflare relay", () => {
     first.target.close();
 
     const second = await connectPair();
-    second.target.send(
-      encodeClose(second.connectionId, "target_done"),
-    );
+    second.target.send(encodeClose(second.connectionId, "target_done"));
     const controllerClose = await second.controller.nextClose();
     expect(controllerClose.code).toBe(1000);
     expect(controllerClose.reason).toBe("target_done");
@@ -540,9 +524,7 @@ describe("Cloudflare relay", () => {
     textPair.target.close();
 
     const oversizedPair = await connectPair();
-    oversizedPair.controller.send(
-      new Uint8Array(MAX_PAYLOAD_BYTES + 1),
-    );
+    oversizedPair.controller.send(new Uint8Array(MAX_PAYLOAD_BYTES + 1));
     expect((await oversizedPair.controller.nextClose()).code).toBe(1009);
     expect(await oversizedPair.target.nextEnvelope()).toMatchObject({
       kind: RelayFrameKind.Close,
@@ -565,9 +547,7 @@ describe("Cloudflare relay", () => {
 
     const oversized = await connectPair();
     oversized.target.send(
-      new Uint8Array(
-        TARGET_ENVELOPE_HEADER_BYTES + MAX_PAYLOAD_BYTES + 1,
-      ),
+      new Uint8Array(TARGET_ENVELOPE_HEADER_BYTES + MAX_PAYLOAD_BYTES + 1),
     );
     expect(await oversized.target.nextEnvelope()).toMatchObject({
       kind: RelayFrameKind.Notice,
@@ -615,9 +595,7 @@ describe("Cloudflare relay", () => {
     );
 
     second.controller.send(Uint8Array.from([12]));
-    expect((await second.target.nextEnvelope()).kind).toBe(
-      RelayFrameKind.Data,
-    );
+    expect((await second.target.nextEnvelope()).kind).toBe(RelayFrameKind.Data);
 
     first.target.close();
     first.controller.close();

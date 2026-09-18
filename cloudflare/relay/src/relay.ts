@@ -10,6 +10,7 @@ import {
   CLOSE_CODE_DELIVERY_FAILED,
   CLOSE_CODE_INTERNAL_ERROR,
   CLOSE_CODE_PROTOCOL_ERROR,
+  CLOSE_CODE_TARGET_REPLACED,
   CLOSE_CODE_TARGET_UNAVAILABLE,
   MAX_CONNECTION_ATTEMPTS_PER_MINUTE,
   MAX_CONNECTION_ID,
@@ -44,8 +45,7 @@ interface SocketAttachment {
   connectionId: number;
 }
 
-interface TargetRegistrationRow
-  extends Record<string, SqlStorageValue> {
+interface TargetRegistrationRow extends Record<string, SqlStorageValue> {
   salt: string;
   verifier: string;
 }
@@ -156,10 +156,7 @@ export class TargetRelay extends DurableObject<Env> {
     }
 
     const keyId = Reflect.get(this.env, "TURN_KEY_ID") as unknown;
-    const apiToken = Reflect.get(
-      this.env,
-      "TURN_KEY_API_TOKEN",
-    ) as unknown;
+    const apiToken = Reflect.get(this.env, "TURN_KEY_API_TOKEN") as unknown;
     if (
       typeof keyId !== "string" ||
       keyId === "" ||
@@ -175,9 +172,8 @@ export class TargetRelay extends DurableObject<Env> {
 
     // Monthly TURN egress ceiling. The relay never sees TURN traffic, so this
     // is a circuit breaker over measured analytics rather than a hard byte cap.
-    const quota = await this.env.TURN_QUOTA.getByName(
-      TURN_QUOTA_SINGLETON,
-    ).evaluate();
+    const quota =
+      await this.env.TURN_QUOTA.getByName(TURN_QUOTA_SINGLETON).evaluate();
     if (!quota.allowed) {
       console.error({
         event: "turn_credential_budget_denied",
@@ -214,8 +210,7 @@ export class TargetRelay extends DurableObject<Env> {
     } catch (error) {
       console.error({
         event: "turn_credential_broker_failed",
-        error_type:
-          error instanceof Error ? error.name : typeof error,
+        error_type: error instanceof Error ? error.name : typeof error,
       });
       return errorResponse(
         502,
@@ -242,11 +237,7 @@ export class TargetRelay extends DurableObject<Env> {
     }
   }
 
-  override webSocketClose(
-    ws: WebSocket,
-    _code: number,
-    reason: string,
-  ): void {
+  override webSocketClose(ws: WebSocket, _code: number, reason: string): void {
     const attachment = parseSocketAttachment(ws.deserializeAttachment());
     if (attachment === null) {
       return;
@@ -255,13 +246,7 @@ export class TargetRelay extends DurableObject<Env> {
     if (attachment.role === "target") {
       this.removeTarget(ws, false);
     } else {
-      this.removeController(
-        attachment.connectionId,
-        ws,
-        false,
-        true,
-        reason,
-      );
+      this.removeController(attachment.connectionId, ws, false, true, reason);
     }
   }
 
@@ -330,20 +315,25 @@ export class TargetRelay extends DurableObject<Env> {
       );
     }
 
-    const currentTarget = this.getOpenTarget();
-    if (currentTarget !== null) {
-      return errorResponse(
-        409,
-        "target_already_connected",
-        "A target is already connected for this route.",
+    // A target that dies without a clean close leaves a socket that still
+    // reads as open, so refusing the reconnect wedges the route permanently:
+    // the legitimate target returns, meets its own zombie, and is locked out
+    // with no way back. The capability check above already proved this is the
+    // same principal, so the fresh connection replaces the stale one. Existing
+    // controllers are kept and reopened against the new socket below.
+    const previousTarget = this.getOpenTarget();
+    if (previousTarget !== null) {
+      console.warn({ event: "relay_target_replaced" });
+      this.target = null;
+      closeSocket(
+        previousTarget,
+        CLOSE_CODE_TARGET_REPLACED,
+        "target_replaced",
       );
     }
 
     const { client, server } = createSocketPair();
-    const attachment = createSocketAttachment(
-      "target",
-      SYSTEM_CONNECTION_ID,
-    );
+    const attachment = createSocketAttachment("target", SYSTEM_CONNECTION_ID);
     this.ctx.acceptWebSocket(server);
     server.serializeAttachment(attachment);
     this.target = server;
@@ -360,9 +350,7 @@ export class TargetRelay extends DurableObject<Env> {
     }
 
     for (const connectionId of this.controllers.keys()) {
-      if (
-        !this.sendFrame(server, encodeOpen(connectionId), "target")
-      ) {
+      if (!this.sendFrame(server, encodeOpen(connectionId), "target")) {
         this.removeTarget(server, true);
         break;
       }
@@ -506,11 +494,7 @@ export class TargetRelay extends DurableObject<Env> {
       return;
     }
     if (envelope.connectionId === SYSTEM_CONNECTION_ID) {
-      this.rejectTarget(
-        ws,
-        "invalid_connection_id",
-        CLOSE_CODE_PROTOCOL_ERROR,
-      );
+      this.rejectTarget(ws, "invalid_connection_id", CLOSE_CODE_PROTOCOL_ERROR);
       return;
     }
 
@@ -519,10 +503,7 @@ export class TargetRelay extends DurableObject<Env> {
       if (controller !== undefined) {
         this.controllers.delete(envelope.connectionId);
       }
-      this.notifyTarget(
-        envelope.connectionId,
-        "controller_not_found",
-      );
+      this.notifyTarget(envelope.connectionId, "controller_not_found");
       return;
     }
 
@@ -555,14 +536,7 @@ export class TargetRelay extends DurableObject<Env> {
     closeCode: number,
     reason: string,
   ): void {
-    this.removeController(
-      connectionId,
-      socket,
-      true,
-      true,
-      reason,
-      closeCode,
-    );
+    this.removeController(connectionId, socket, true, true, reason, closeCode);
   }
 
   private rejectTarget(
@@ -582,11 +556,7 @@ export class TargetRelay extends DurableObject<Env> {
     const target = this.getOpenTarget();
     if (
       target !== null &&
-      !this.sendFrame(
-        target,
-        encodeNotice(connectionId, message),
-        "target",
-      )
+      !this.sendFrame(target, encodeNotice(connectionId, message), "target")
     ) {
       this.removeTarget(target, true);
     }
@@ -629,9 +599,7 @@ export class TargetRelay extends DurableObject<Env> {
       closeSocket(socket, closeCode, reason);
     }
 
-    for (const [connectionId, controller] of [
-      ...this.controllers.entries(),
-    ]) {
+    for (const [connectionId, controller] of [...this.controllers.entries()]) {
       this.removeController(
         connectionId,
         controller,
@@ -664,11 +632,7 @@ export class TargetRelay extends DurableObject<Env> {
       const target = this.getOpenTarget();
       if (
         target !== null &&
-        !this.sendFrame(
-          target,
-          encodeClose(connectionId, reason),
-          "target",
-        )
+        !this.sendFrame(target, encodeClose(connectionId, reason), "target")
       ) {
         this.removeTarget(target, true);
       }
@@ -710,10 +674,7 @@ export class TargetRelay extends DurableObject<Env> {
   ): Promise<AuthorizationResult> {
     let registration = this.readTargetRegistration();
     if (registration === null) {
-      const candidate = await createRegistrationVerifier(
-        route,
-        capability,
-      );
+      const candidate = await createRegistrationVerifier(route, capability);
       if (candidate === null) {
         return "denied";
       }
@@ -862,9 +823,7 @@ export function reconstructSocketState(
   return { target, controllers, invalid };
 }
 
-export function parseSocketAttachment(
-  value: unknown,
-): SocketAttachment | null {
+export function parseSocketAttachment(value: unknown): SocketAttachment | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return null;
   }
@@ -877,8 +836,7 @@ export function parseSocketAttachment(
     !isValidConnectionId(record.connectionId) ||
     (record.role === "target" &&
       record.connectionId !== SYSTEM_CONNECTION_ID) ||
-    (record.role === "controller" &&
-      record.connectionId < MIN_CONNECTION_ID)
+    (record.role === "controller" && record.connectionId < MIN_CONNECTION_ID)
   ) {
     return null;
   }
@@ -936,14 +894,12 @@ function closeSocket(socket: WebSocket, code: number, reason: string): void {
 }
 
 function sanitizeWebSocketCloseCode(code: number): number {
-  return (
-    code >= 1000 &&
+  return code >= 1000 &&
     code <= 4999 &&
     code !== 1004 &&
     code !== 1005 &&
     code !== 1006 &&
     code !== 1015
-  )
     ? code
     : CLOSE_CODE_INTERNAL_ERROR;
 }

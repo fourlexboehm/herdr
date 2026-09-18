@@ -24,6 +24,7 @@ export const CLOSE_CODE_PROTOCOL_ERROR = 4400;
 export const CLOSE_CODE_TARGET_UNAVAILABLE = 4404;
 export const CLOSE_CODE_DELIVERY_FAILED = 4408;
 export const CLOSE_CODE_INTERNAL_ERROR = 4411;
+export const CLOSE_CODE_TARGET_REPLACED = 4412;
 
 // Monthly TURN egress ceiling. Cloudflare exposes no native TURN data cap and
 // the relay is not on the TURN data path, so the ceiling is enforced by
