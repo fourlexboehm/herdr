@@ -5,6 +5,7 @@ import {
 } from "./routing";
 
 export { TargetRelay } from "./relay";
+export { TurnQuota } from "./quota";
 
 const worker = {
   async fetch(request: Request, env: Env): Promise<Response> {

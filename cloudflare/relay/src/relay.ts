@@ -34,6 +34,7 @@ import {
   RelayProtocolError,
   type TargetEnvelope,
 } from "./protocol";
+import { TURN_QUOTA_SINGLETON } from "./quota";
 import { parseRelayUpgrade, type RelayRole } from "./routing";
 import { generateTurnAllocation } from "./turn";
 
@@ -171,6 +172,32 @@ export class TargetRelay extends DurableObject<Env> {
         "This relay does not have Cloudflare TURN configured.",
       );
     }
+
+    // Monthly TURN egress ceiling. The relay never sees TURN traffic, so this
+    // is a circuit breaker over measured analytics rather than a hard byte cap.
+    const quota = await this.env.TURN_QUOTA.getByName(
+      TURN_QUOTA_SINGLETON,
+    ).evaluate();
+    if (!quota.allowed) {
+      console.error({
+        event: "turn_credential_budget_denied",
+        quota_state: quota.state,
+      });
+      if (quota.state === "not_configured") {
+        return errorResponse(
+          501,
+          "turn_not_configured",
+          "This relay does not have TURN usage accounting configured.",
+        );
+      }
+      return errorResponse(
+        503,
+        "turn_budget_exhausted",
+        "The relay TURN egress budget is unavailable or spent.",
+        { "Retry-After": "900" },
+      );
+    }
+
     try {
       const allocations = await Promise.all([
         generateTurnAllocation(keyId, apiToken),

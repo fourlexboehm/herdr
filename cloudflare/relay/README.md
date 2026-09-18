@@ -40,25 +40,50 @@ allocations for an authenticated controller connection. ICE tries direct paths
 first and uses TURN only when NAT or firewall behavior prevents them.
 
 Create a Cloudflare Realtime TURN key, then configure its ID and API token as
-Worker secrets:
+Worker secrets, plus an account id and an analytics token for usage accounting:
 
 ```bash
 npx wrangler secret put TURN_KEY_ID
 npx wrangler secret put TURN_KEY_API_TOKEN
+npx wrangler secret put CF_ACCOUNT_ID
+npx wrangler secret put TURN_ANALYTICS_API_TOKEN
 ```
 
-Without both secrets, the endpoint returns `turn_not_configured`; Herdr still
-tries direct ICE/STUN, but the connection fails and retries if no direct path
-opens. The long-lived TURN API token is never returned to Herdr. Only the
-generated short-lived credentials cross the target-authenticated endpoint.
+`TURN_ANALYTICS_API_TOKEN` needs the **Account Analytics** read permission and
+is only used to measure usage. Without `TURN_KEY_ID` or `TURN_KEY_API_TOKEN`
+the endpoint returns `turn_not_configured`. Without `CF_ACCOUNT_ID` or
+`TURN_ANALYTICS_API_TOKEN` it also returns `turn_not_configured`, because the
+egress budget below fails closed and the relay will not broker credentials it
+cannot account for. In both cases Herdr still tries direct ICE/STUN, but the
+connection fails and retries if no direct path opens. The long-lived TURN API
+token is never returned to Herdr. Only the generated short-lived credentials
+cross the target-authenticated endpoint.
 
-Controllers are accepted only while the target is connected. A duplicate live
-target receives an HTTP 409 response and the existing target remains active.
-Each route accepts at most 16 controller connection attempts per minute and 16
-simultaneous controller sockets. The target closes controllers that do not
-complete the end-to-end handshake within 10 seconds, so a holder of an old
-route id cannot reserve those slots indefinitely. Authenticated target
-reconnects use an independent rate budget.
+## TURN egress budget
+
+Cloudflare Realtime bills TURN on `egressBytes` and exposes no native data cap,
+and the relay is not on the TURN data path, so the monthly ceiling is a
+**measured circuit breaker, not a hard limit**.
+
+`TURN_MONTHLY_EGRESS_LIMIT_BYTES` (default `1000000000000`, 1 TB, matching the
+1,000 GB Realtime free tier shared by SFU and TURN) sets the ceiling. A
+singleton `TurnQuota` Durable Object queries month-to-date `sum(egressBytes)`
+for the configured `keyId` from the `callsTurnUsageAdaptiveGroups` GraphQL
+dataset, caches the reading for five minutes, and coalesces concurrent
+refreshes into one query. Minting stops at 95% of the ceiling because TURN
+analytics is adaptively sampled at collection and at query time, so the figure
+is an estimate rather than an exact count.
+
+The budget fails closed. A missing reading, a reading older than fifteen
+minutes, a reading from a previous month, an analytics outage, or a
+misconfigured account id all resolve to `turn_budget_exhausted` (HTTP 503)
+rather than permitting unaccounted spend. An empty analytics `accounts` array
+is treated as an error, never as zero usage. Herdr treats any non-success
+response as "TURN unavailable" and continues with direct ICE/STUN.
+
+Credentials already issued keep working until their 24-hour TTL expires, so the
+effective ceiling exceeds the configured one by whatever outstanding
+credentials can still pull before expiring.
 
 ## Relay protocol version 1
 
@@ -85,7 +110,8 @@ Payload length is capped at 1 MiB and must exactly match the header.
 
 Hibernating sockets serialize only protocol version, role, and connection id.
 SQLite stores the salted target verifier and bounded connection-attempt and
-TURN-credential request counters only. Peer configuration and SDP signaling
+TURN-credential request counters only. The budget singleton stores a single
+measured month-to-date egress reading. Peer configuration and SDP signaling
 are inside the end-to-end encrypted controller payloads and remain opaque to
 the Worker.
 

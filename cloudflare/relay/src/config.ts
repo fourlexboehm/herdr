@@ -24,3 +24,23 @@ export const CLOSE_CODE_PROTOCOL_ERROR = 4400;
 export const CLOSE_CODE_TARGET_UNAVAILABLE = 4404;
 export const CLOSE_CODE_DELIVERY_FAILED = 4408;
 export const CLOSE_CODE_INTERNAL_ERROR = 4411;
+
+// Monthly TURN egress ceiling. Cloudflare exposes no native TURN data cap and
+// the relay is not on the TURN data path, so the ceiling is enforced by
+// measuring usage through the GraphQL analytics API and refusing to mint new
+// credentials once it is spent.
+export const DEFAULT_TURN_MONTHLY_EGRESS_LIMIT_BYTES = 1_000_000_000_000;
+
+// Trip below the ceiling: TURN analytics is adaptively sampled at collection
+// and at query time, so the observed figure is an estimate.
+export const TURN_QUOTA_SAFETY_NUMERATOR = 95;
+export const TURN_QUOTA_SAFETY_DENOMINATOR = 100;
+
+// A cached reading is reused for this long before a request refreshes it.
+export const TURN_QUOTA_REFRESH_INTERVAL_MS = 5 * 60_000;
+
+// Beyond this age the reading is treated as unknown and minting fails closed.
+export const TURN_QUOTA_MAX_STALENESS_MS = 15 * 60_000;
+
+export const TURN_QUOTA_ANALYTICS_TIMEOUT_MS = 5_000;
+export const TURN_QUOTA_MAX_ANALYTICS_RESPONSE_BYTES = 64 * 1024;

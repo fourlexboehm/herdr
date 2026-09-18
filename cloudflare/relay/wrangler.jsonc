@@ -9,6 +9,10 @@
       {
         "name": "TARGET_RELAY",
         "class_name": "TargetRelay"
+      },
+      {
+        "name": "TURN_QUOTA",
+        "class_name": "TurnQuota"
       }
     ]
   },
@@ -16,8 +20,18 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["TargetRelay"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["TurnQuota"]
     }
   ],
+  "vars": {
+    // Monthly TURN egress ceiling in bytes. Cloudflare Realtime's free tier is
+    // 1,000 GB per month shared across SFU and TURN. The relay trips below
+    // this value because TURN analytics is adaptively sampled.
+    "TURN_MONTHLY_EGRESS_LIMIT_BYTES": "1000000000000"
+  },
   "observability": {
     "enabled": true,
     "logs": {
